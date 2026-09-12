@@ -36,3 +36,8 @@ test_*.py
 explore_*.py
 traj_*.png
 worst_*.png
+
+# Training data (too large for git)
+training/
+*.bin
+*.gguf
