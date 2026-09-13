@@ -300,13 +300,18 @@ fn main() {
     lex_ids.sort();
     lex_ids.dedup();
 
+    // Inverter co-ocorrências: lex_id → [(outro, count)]
+    let mut lex_cooccur: HashMap<u32, Vec<(u32, f32)>> = HashMap::new();
+    for (&(a, b), &count) in &cooccurrence {
+        lex_cooccur.entry(a).or_default().push((b, count));
+        lex_cooccur.entry(b).or_default().push((a, count));
+    }
+
     for &lex_id in &lex_ids {
         let mut embedding: u32 = 0;
 
-        // Somar projeções dos contextos
-        for ((a, b), &count) in &cooccurrence {
-            if *a == lex_id || *b == lex_id {
-                let other = if *a == lex_id { *b } else { *a };
+        if let Some(neighbors) = lex_cooccur.get(&lex_id) {
+            for &(other, _count) in neighbors {
                 if (other as usize) < projection[0].len() {
                     for dim in 0..n_dims {
                         if projection[dim][other as usize] > 0 {
@@ -424,7 +429,7 @@ fn main() {
     println!();
     println!("▸ FASE 10: Treinamento STDP iterativo...");
 
-    grammar.train_snn_iterative(20, 0.01);
+    grammar.train_snn_iterative(10, 0.01);
 
     println!();
     println!("═══════════════════════════════════════════════════════════");

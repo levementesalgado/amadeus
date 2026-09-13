@@ -107,7 +107,7 @@ impl TripleGrammar {
         let enc = self.snn_enc.as_ref().unwrap().clone();
         let net = self.snn.as_mut().unwrap();
 
-        let samples_per_epoch = 1000.min(lexicon_clone.values().map(|m| m.len()).sum::<usize>());
+        let samples_per_epoch = 500.min(lexicon_clone.values().map(|m| m.len()).sum::<usize>());
 
         println!("    Treinando SNN por {} épocas (lr={})...", epochs, learning_rate);
         let results = net.iterative_train(
