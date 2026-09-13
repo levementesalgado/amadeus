@@ -296,6 +296,94 @@ impl SpikingNetwork {
             }
         }
     }
+
+    // ─── Treinamento iterativo STDP ───
+    /// Treina o SNN em múltiplas épocas com exemplos do grammar
+    /// Retorna (época, acurácia_top1, acurácia_top3) por época
+    pub fn iterative_train(
+        &mut self,
+        enc: &MorphEncoding,
+        grammar_lexicon: &HashMap<(u16, u8, u16), HashMap<u32, f32>>,
+        epochs: usize,
+        learning_rate: f32,
+        samples_per_epoch: usize,
+    ) -> Vec<(usize, f32, f32)> {
+        let mut results = Vec::new();
+        let mut rng = fastrand::Rng::with_seed(42);
+
+        // Extrair exemplos de treinamento do grammar
+        let mut training_examples: Vec<(u16, u8, u16, u32)> = Vec::new();
+        for (&(morph, syn_func, style), candidates) in grammar_lexicon {
+            for &lex_id in candidates.keys() {
+                training_examples.push((morph, syn_func, style, lex_id));
+            }
+        }
+
+        if training_examples.is_empty() {
+            return results;
+        }
+
+        println!("    Exemplos de treinamento: {}", training_examples.len());
+
+        for epoch in 0..epochs {
+            // Embaralhar exemplos (Fisher-Yates com fastrand)
+            let n = training_examples.len();
+            for i in (1..n).rev() {
+                let j = rng.usize(0..=i);
+                training_examples.swap(i, j);
+            }
+
+            let n_samples = samples_per_epoch.min(training_examples.len());
+            let mut correct_top1 = 0usize;
+            let mut correct_top3 = 0usize;
+
+            for idx in 0..n_samples {
+                let (morph, syn_func, style, target_lex) = training_examples[idx];
+
+                // Criar spike trains de entrada
+                let trains = enc.encode(morph, syn_func, style, self.tsteps, &mut rng);
+
+                // Rodar SNN
+                let output_spikes = self.run(&trains);
+
+                // Encontrar rank do target
+                let mut scores: Vec<(u32, f32)> = self.output_neurons.iter().enumerate()
+                    .map(|(i, n)| {
+                        let lex_id = self.output_labels[i];
+                        let spike_count = output_spikes.get(i).map(|s| s.len()).unwrap_or(0) as f32;
+                        let potential: f32 = n.spike_times.iter().map(|&t| (-(t as f32) / 5.0).exp()).sum();
+                        (lex_id, spike_count + potential)
+                    })
+                    .collect();
+                scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+                // Verificar se target está no top-1 e top-3
+                for (rank, &(lex_id, _)) in scores.iter().take(3).enumerate() {
+                    if lex_id == target_lex {
+                        if rank == 0 { correct_top1 += 1; }
+                        correct_top3 += 1;
+                        break;
+                    }
+                }
+
+                // Treinar com STDP (target = output neuron do target_lex)
+                if let Some(target_idx) = self.output_labels.iter().position(|&id| id == target_lex) {
+                    self.stdp_train(&trains, target_idx, learning_rate);
+                }
+            }
+
+            let acc_top1 = correct_top1 as f32 / n_samples as f32;
+            let acc_top3 = correct_top3 as f32 / n_samples as f32;
+            results.push((epoch + 1, acc_top1, acc_top3));
+
+            if (epoch + 1) % 5 == 0 || epoch == 0 {
+                println!("    Época {}: Top-1={:.1}% Top-3={:.1}%",
+                    epoch + 1, acc_top1 * 100.0, acc_top3 * 100.0);
+            }
+        }
+
+        results
+    }
 }
 
 // ─── Features morfológicos (índices no vetor de input) ───

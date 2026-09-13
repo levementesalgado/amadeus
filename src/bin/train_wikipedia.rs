@@ -137,18 +137,23 @@ fn word_style(id: u32, class: u8) -> u16 {
 
 fn main() {
     println!("╔══════════════════════════════════════════════════════════╗");
-    println!("║  AMADEUS — TREINAMENTO COM WIKIPÉDIA PT               ║");
+    println!("║  AMADEUS — TREINAMENTO MISTO (WIKIPÉDIA + NARRATIVO)  ║");
     println!("╚══════════════════════════════════════════════════════════╝");
     println!();
 
     // ─── FASE 1: Coletar textos ───
-    println!("▸ FASE 1: Coletando textos da Wikipédia PT...");
+    println!("▸ FASE 1: Coletando textos...");
 
     let wiki_dir = "training/wikipedia";
+    let narrative_dir = "training/narrative";
     let mut all_text = String::new();
     let mut file_count = 0;
+    let mut wiki_chars = 0usize;
+    let mut narrative_chars = 0usize;
 
+    // Carregar Wikipédia
     if Path::new(wiki_dir).exists() {
+        println!("  📚 Wikipédia:");
         for entry in fs::read_dir(wiki_dir).unwrap().flatten() {
             let path = entry.path();
             if path.extension().map(|e| e == "txt").unwrap_or(false) {
@@ -156,16 +161,43 @@ fn main() {
                     let file_name = path.file_stem()
                         .and_then(|s| s.to_str())
                         .unwrap_or("?");
-                    println!("  → {} ({} KB)", file_name, content.len() / 1024);
-                    all_text.push_str(&content);
-                    all_text.push('\n');
-                    file_count += 1;
+                    if content.len() > 100 {
+                        println!("    → {} ({} KB)", file_name, content.len() / 1024);
+                        all_text.push_str(&content);
+                        all_text.push('\n');
+                        wiki_chars += content.len();
+                        file_count += 1;
+                    }
                 }
             }
         }
     }
 
-    println!("  {} arquivos, {} caracteres totais", file_count, all_text.len());
+    // Carregar narrativos
+    if Path::new(narrative_dir).exists() {
+        println!("  📖 Narrativos (romances):");
+        for entry in fs::read_dir(narrative_dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.extension().map(|e| e == "txt").unwrap_or(false) {
+                if let Ok(content) = fs::read_to_string(&path) {
+                    let file_name = path.file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("?");
+                    if content.len() > 1000 {
+                        println!("    → {} ({} KB)", file_name, content.len() / 1024);
+                        all_text.push_str(&content);
+                        all_text.push('\n');
+                        narrative_chars += content.len();
+                        file_count += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    println!("  {} arquivos totais", file_count);
+    println!("  Wikipédia: {} KB | Narrativos: {} KB | Total: {} KB",
+        wiki_chars / 1024, narrative_chars / 1024, all_text.len() / 1024);
     println!();
 
     // ─── FASE 2: Treinar HMM ───
@@ -388,8 +420,14 @@ fn main() {
             snn.synapses_ih.len(), snn.synapses_ho.len());
     }
 
+    // ─── FASE 10: STDP iterativo ───
+    println!();
+    println!("▸ FASE 10: Treinamento STDP iterativo...");
+
+    grammar.train_snn_iterative(20, 0.01);
+
     println!();
     println!("═══════════════════════════════════════════════════════════");
-    println!("  TREINAMENTO COM WIKIPÉDIA COMPLETO");
+    println!("  TREINAMENTO MISTO COMPLETO");
     println!("═══════════════════════════════════════════════════════════");
 }

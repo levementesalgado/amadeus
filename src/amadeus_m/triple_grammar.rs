@@ -96,6 +96,36 @@ impl TripleGrammar {
         self.snn_enc = Some(enc);
     }
 
+    // ─── Treinamento iterativo STDP ───
+    pub fn train_snn_iterative(&mut self, epochs: usize, learning_rate: f32) {
+        if self.snn.is_none() || self.snn_enc.is_none() {
+            println!("  SNN não construída. Execute build_snn() primeiro.");
+            return;
+        }
+
+        let lexicon_clone = self.lexicon.clone();
+        let enc = self.snn_enc.as_ref().unwrap().clone();
+        let net = self.snn.as_mut().unwrap();
+
+        let samples_per_epoch = 1000.min(lexicon_clone.values().map(|m| m.len()).sum::<usize>());
+
+        println!("    Treinando SNN por {} épocas (lr={})...", epochs, learning_rate);
+        let results = net.iterative_train(
+            &enc,
+            &lexicon_clone,
+            epochs,
+            learning_rate,
+            samples_per_epoch,
+        );
+
+        // Resumo final
+        if let Some(&(_, last_top1, last_top3)) = results.last() {
+            println!("    Treinamento concluído:");
+            println!("      Top-1 final: {:.1}%", last_top1 * 100.0);
+            println!("      Top-3 final: {:.1}%", last_top3 * 100.0);
+        }
+    }
+
     // ─── Amostragem via SNN (substitui cascade T3) ───
 
     pub fn snn_sample(&mut self, morph: u16, syn_func: u8, style: u16, candidate: u32) -> u32 {
