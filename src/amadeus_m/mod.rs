@@ -27,6 +27,7 @@ pub mod pcfg;
 pub mod snn;
 pub mod embedding_compressor;
 pub mod dual_loader;
+pub mod hmm;
 
 pub use config::AmadeusMConfig;
 pub use model::AmadeusMModel;

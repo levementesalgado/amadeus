@@ -44,8 +44,8 @@ fn nearest_head(tokens: &[Token7], from: usize, target_class: u8) -> Option<i16>
     let mut best: Option<(i16, i16)> = None;
     for (j, t) in tokens.iter().enumerate() {
         if t.morph_class() == target_class && j != from {
-            let dist = j as i16 - from as i16;
-            let abs = dist.abs();
+            let dist = (j as i32 - from as i32) as i16;
+            let abs = dist.wrapping_abs();
             if best.map_or(true, |(_, b)| abs < b) {
                 best = Some((dist, abs));
             }
@@ -59,17 +59,17 @@ fn assign_noun(out: &mut [Token7], i: usize, root_idx: usize) {
 
     if i < root_idx {
         // Left of verb → likely subject
-        out[i].syn_off = -(root_idx as i16 - i as i16);
+        out[i].syn_off = (i as i32 - root_idx as i32) as i16;
         out[i].syn_func = if has_prep { SYN_OI } else { SYN_SUJEITO };
     } else {
         // Right of verb → likely object
-        out[i].syn_off = -(root_idx as i16 - i as i16);
+        out[i].syn_off = (i as i32 - root_idx as i32) as i16;
         out[i].syn_func = if has_prep { SYN_OI } else { SYN_OD };
     }
 }
 
 fn assign_verb(out: &mut [Token7], i: usize, root_idx: usize) {
-    out[i].syn_off = -(root_idx as i16 - i as i16);
+    out[i].syn_off = (i as i32 - root_idx as i32) as i16;
     out[i].syn_func = SYN_PRED;
 }
 
@@ -91,7 +91,7 @@ fn assign_art(out: &mut [Token7], i: usize, _root_idx: usize) {
         head += 1;
     }
     if head < out.len() {
-        out[i].syn_off = -(head as i16 - i as i16);
+        out[i].syn_off = (i as i32 - head as i32) as i16;
     } else {
         out[i].syn_off = 0;
     }
@@ -105,7 +105,7 @@ fn assign_prep(out: &mut [Token7], i: usize, _root_idx: usize) {
         head += 1;
     }
     if head < out.len() {
-        out[i].syn_off = -(head as i16 - i as i16);
+        out[i].syn_off = (i as i32 - head as i32) as i16;
     } else {
         out[i].syn_off = 0;
     }
@@ -117,7 +117,7 @@ fn assign_other(out: &mut [Token7], i: usize, root_idx: usize) {
         out[i].syn_off = dist;
         out[i].syn_func = SYN_ADV;
     } else {
-        out[i].syn_off = -(root_idx as i16 - i as i16);
+        out[i].syn_off = (i as i32 - root_idx as i32) as i16;
         out[i].syn_func = SYN_ADV;
     }
 }

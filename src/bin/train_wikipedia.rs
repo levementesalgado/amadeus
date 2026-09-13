@@ -1,14 +1,17 @@
 use amadeus::amadeus_m::triple_grammar::TripleGrammar;
 use amadeus::amadeus_m::token7::Token7;
+use amadeus::amadeus_m::hmm::{HmmPosTagger, TAG_SUBST, TAG_VERBO, TAG_ADJ, TAG_ART, TAG_ADV, TAG_PREP, TAG_CONJ, TAG_PONT};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
 /// Compilador simplificado que aprende vocabulário diretamente do texto
+/// Usa HMM para classificação automática de palavras
 struct SimpleCompiler {
     lexicon: HashMap<String, (u32, u16, u8, u16)>, // word -> (id, morph, class, style)
     roots: Vec<String>,
     next_id: u32,
+    hmm: HmmPosTagger,
 }
 
 impl SimpleCompiler {
@@ -17,6 +20,7 @@ impl SimpleCompiler {
             lexicon: HashMap::new(),
             roots: vec![String::new()],
             next_id: 1,
+            hmm: HmmPosTagger::new(),
         };
 
         // Adicionar pontuação (class 6 = PONTUACAO)
@@ -28,95 +32,100 @@ impl SimpleCompiler {
         c
     }
 
+    /// Tokenizar texto bruto em sentenças de palavras
+    fn tokenize_sentences(text: &str) -> Vec<Vec<String>> {
+        text.split(|c| c == '.' || c == '!' || c == '?')
+            .filter(|s| s.trim().len() > 10)
+            .map(|sent| {
+                sent.split(|c: char| c.is_whitespace() || c == ',' || c == ';' || c == ':' || c == '(' || c == ')')
+                    .filter(|w| !w.trim().is_empty())
+                    .map(|w| w.to_lowercase())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|words| words.len() >= 2)
+            .collect()
+    }
+
+    /// Treinar o HMM com texto bruto
+    fn train_hmm(&mut self, text: &str) {
+        println!("  Tokenizando para HMM...");
+        let sentences = Self::tokenize_sentences(text);
+        println!("  {} sentenças para treinar HMM", sentences.len());
+
+        self.hmm.train(&sentences);
+
+        let stats = self.hmm.stats();
+        println!("  HMM treinado:");
+        let tag_names = ["SUBST", "VERBO", "ADJ", "ART", "ADV", "PREP", "CONJ", "PONT"];
+        for (i, name) in tag_names.iter().enumerate() {
+            println!("    {}: {:.1}% prior, {} palavras",
+                name, stats.prior[i] * 100.0, stats.word_counts[i]);
+        }
+
+        // Mostrar top 3 palavras por tag
+        let top = self.hmm.top_words_per_tag(3);
+        for (i, name) in tag_names.iter().enumerate() {
+            let words: Vec<&str> = top[i].iter().map(|(w, _)| w.as_str()).collect();
+            if !words.is_empty() {
+                println!("    {} top: {}", name, words.join(", "));
+            }
+        }
+    }
+
+    /// Compilar texto usando HMM para classificação
     fn compile(&mut self, text: &str) -> Vec<Token7> {
         let mut tokens = Vec::new();
-        let words: Vec<&str> = text.split(|c: char| c.is_whitespace() || c == ',' || c == '.' || c == '!' || c == '?' || c == ';' || c == ':').collect();
+        let words: Vec<String> = text.split(|c: char| c.is_whitespace() || c == ',' || c == '.' || c == '!' || c == '?' || c == ';' || c == ':')
+            .filter(|w| !w.trim().is_empty())
+            .map(|w| w.to_lowercase())
+            .collect();
 
-        for w in words {
-            let w = w.trim();
-            if w.is_empty() { continue; }
+        if words.is_empty() { return tokens; }
 
-            // Verificar pontuação
-            if let Some(&(id, morph, class, style)) = self.lexicon.get(w) {
+        // Usar HMM para taggear a frase inteira
+        let tags = self.hmm.viterbi(&words);
+
+        for (i, w) in words.iter().enumerate() {
+            // Verificar se já está no léxico
+            if let Some(&(id, morph, _class, style)) = self.lexicon.get(w) {
                 tokens.push(Token7::new(id, morph).with_style(style));
                 continue;
             }
 
-            // Palavra desconhecida - aprender
-            let lower = w.to_lowercase();
-            if let Some(&(id, morph, class, style)) = self.lexicon.get(&lower) {
-                tokens.push(Token7::new(id, morph).with_style(style));
-                continue;
-            }
-
-            // Inferir classe morfológica
-            let (id, morph, class, style) = self.infer_word(&lower);
+            // HMM classificou esta palavra
+            let tag = tags[i];
+            let (id, morph, class, style) = self.register_word(w, tag);
             tokens.push(Token7::new(id, morph).with_style(style));
         }
 
         tokens
     }
 
-    fn infer_word(&mut self, word: &str) -> (u32, u16, u8, u16) {
+    /// Registrar palavra no léxico com a classe dada pelo HMM
+    fn register_word(&mut self, word: &str, tag: usize) -> (u32, u16, u8, u16) {
         let id = self.next_id;
         self.next_id += 1;
 
-        // Salvar raiz
         if id as usize >= self.roots.len() {
             self.roots.resize(id as usize + 1, String::new());
         }
         self.roots[id as usize] = word.to_string();
 
-        // Inferir classe morfológica
-        let (class, morph_bits) = if word.ends_with("ção") || word.ends_with("ões") || word.ends_with("mento") || word.ends_with("ismo") || word.ends_with("idade") || word.ends_with("agem") {
-            (0, 0b0000_0001u16) // SUBST (sufixos nominais)
-        } else if word.ends_with("mente") {
-            (4, 0b0000_0010u16) // ADVERB
-        } else if word.ends_with("oso") || word.ends_with("osa") || word.ends_with("vel") || word.ends_with("al") || word.ends_with("ível") || word.ends_with("ário") || word.ends_with("ário") || word.ends_with("ico") || word.ends_with("ica") || word.ends_with("nte") || word.ends_with("nte") {
-            (2, 0b0000_0100u16) // ADJ (muitos sufixos)
-        } else if word.ends_with("ar") || word.ends_with("ear") || word.ends_with("izar") || word.ends_with("ar") || word.ends_with("or") {
-            (1, 0b0000_1000u16) // VERB (infinitivo/gerúndio)
-        } else if word.ends_with("ou") || word.ends_with("iu") || word.ends_with("eu") || word.ends_with("amos") || word.ends_with("eis") || word.ends_with("em") {
-            (1, 0b0001_0000u16) // VERB (passado/presente)
-        } else if word.ends_with("ado") || word.ends_with("ido") || word.ends_with("ito") || word.ends_with("sto") {
-            (1, 0b0010_0000u16) // VERB (particípio)
-        } else if word == "o" || word == "os" {
-            (3, 0b0100_0000u16) // ART (masculino)
-        } else if word == "a" || word == "as" {
-            (3, 0b1000_0000u16) // ART (feminino)
-        } else if word == "um" || word == "uns" {
-            (3, 0b0100_0001u16) // ART (indefinido masc)
-        } else if word == "uma" || word == "umas" {
-            (3, 0b1000_0001u16) // ART (indefinido fem)
-        } else if word == "de" || word == "do" || word == "da" || word == "dos" || word == "das" {
-            (5, 0b0000_0011u16) // PREP (contração)
-        } else if word == "em" || word == "no" || word == "na" || word == "nos" || word == "nas" {
-            (5, 0b0000_0110u16) // PREP (locução)
-        } else if word == "por" || word == "para" || word == "com" || word == "sem" || word == "sob" {
-            (5, 0b0000_1001u16) // PREP (simples)
-        } else if word == "e" || word == "ou" || word == "mas" || word == "porém" || word == "então" {
-            (5, 0b0000_1100u16) // CONJ
-        } else if word == "que" || word == "se" || word == "como" || word == "quando" {
-            (5, 0b0000_1111u16) // CONJ (subord)
-        } else if word == "eu" || word == "tu" || word == "ele" || word == "ela" || word == "nós" || word == "vós" || word == "eles" || word == "elas" {
-            (3, 0b0001_0000u16) // PRON
-        } else if word == "isto" || word == "isso" || word == "aquilo" || word == "este" || word == "esse" || word == "aquele" {
-            (3, 0b0010_0000u16) // PRON (demostrativo)
-        } else if word == "bem" || word == "mal" || word == "muito" || word == "pouco" || word == "mais" || word == "menos" {
-            (4, 0b0001_0001u16) // ADVERB (grau)
-        } else if word == "aqui" || word == "aí" || word == "ali" || word == "lá" || word == "cá" || word == "onde" {
-            (4, 0b0010_0010u16) // ADVERB (lugar)
-        } else if word == "agora" || word == "então" || word == "depois" || word == "antes" || word == "sempre" || word == "nunca" {
-            (4, 0b0011_0011u16) // ADVERB (tempo)
-        } else {
-            // Default: SUBST com bits baseados no ID
-            let bits = (id as u16).wrapping_mul(0x9E37) & 0x00FF;
-            (0, bits)
+        // Mapear tag HMM para classe Amadeus
+        let (class, morph_bits) = match tag {
+            TAG_SUBST => (0, (id as u16).wrapping_mul(0x9E37) & 0x00FF),
+            TAG_VERBO => (1, 0b0000_1000u16),
+            TAG_ADJ => (2, 0b0000_0100u16),
+            TAG_ART => (3, 0b0100_0000u16),
+            TAG_ADV => (4, 0b0000_0010u16),
+            TAG_PREP => (5, 0b0000_0011u16),
+            TAG_CONJ => (5, 0b0000_1100u16),
+            TAG_PONT => (6, 0u16),
+            _ => (0, (id as u16).wrapping_mul(0x9E37) & 0x00FF),
         };
 
         let style = word_style(id, class);
         self.lexicon.insert(word.to_string(), (id, morph_bits | (class as u16), class, style));
-
         (id, morph_bits | (class as u16), class, style)
     }
 }
@@ -159,10 +168,15 @@ fn main() {
     println!("  {} arquivos, {} caracteres totais", file_count, all_text.len());
     println!();
 
-    // ─── FASE 2: Compilar tokens ───
-    println!("▸ FASE 2: Compilando tokens...");
+    // ─── FASE 2: Treinar HMM ───
+    println!("▸ FASE 2: Treinando HMM para classificação automática...");
 
     let mut compiler = SimpleCompiler::new();
+    compiler.train_hmm(&all_text);
+    println!();
+
+    // ─── FASE 3: Compilar tokens com HMM ───
+    println!("▸ FASE 3: Compilando tokens com HMM...");
 
     // Dividir em frases
     let sentences: Vec<&str> = all_text
@@ -184,26 +198,29 @@ fn main() {
     println!("  {} tokens compilados", all_tokens.len());
     println!();
 
-    // ─── FASE 3: Treinar gramática ───
-    println!("▸ FASE 3: Treinando gramática...");
+    // ─── FASE 4: Treinar gramática ───
+    println!("▸ FASE 4: Treinando gramática...");
 
     let mut grammar = TripleGrammar::new(3);
-    let tokens_with_deps = amadeus::amadeus_m::syntax::assign_dependencies(&all_tokens);
 
-    // Treinar em lotes
-    let batch_size = 100;
-    for (i, batch) in tokens_with_deps.chunks(batch_size).enumerate() {
-        grammar.train(batch);
-        if (i + 1) % 100 == 0 {
-            println!("  ... {} tokens processados", (i + 1) * batch_size);
+    // Treinar por frase (não em todos os tokens de uma vez - O(n²))
+    let mut processed = 0usize;
+    for sentence in &sentences {
+        let tokens = compiler.compile(sentence);
+        if tokens.len() < 2 { continue; }
+        let tokens_with_deps = amadeus::amadeus_m::syntax::assign_dependencies(&tokens);
+        grammar.train(&tokens_with_deps);
+        processed += tokens_with_deps.len();
+        if processed % 10000 < 100 {
+            println!("  ... {} tokens processados", processed);
         }
     }
 
     println!("  Treinamento concluído");
     println!();
 
-    // ─── FASE 4: Construir GRAPH embeddings ───
-    println!("▸ FASE 4: Construindo GRAPH embeddings...");
+    // ─── FASE 5: Construir GRAPH embeddings ───
+    println!("▸ FASE 5: Construindo GRAPH embeddings...");
 
     // Usar random indexing para criar embeddings de 32 bits
     // Cada palavra recebe um vetor esparso baseado em coocorrência
@@ -278,8 +295,8 @@ fn main() {
     println!("  GRAPH: {} embeddings criados", graph.len());
     println!();
 
-    // ─── FASE 5: Métricas ───
-    println!("▸ FASE 5: Métricas do treinamento...");
+    // ─── FASE 6: Métricas ───
+    println!("▸ FASE 6: Métricas do treinamento...");
 
     let lex_count = grammar.lexicon.len();
     let t2_count = grammar.agreement.len();
@@ -290,10 +307,25 @@ fn main() {
     println!("  T2 (concordância): {} padrões", t2_count);
     println!("  T3 (seleção): {} entradas", t3_count);
     println!("  GRAPH: {} embeddings", graph_count);
+
+    // Distribuição de classes
+    let mut class_counts = [0u32; 8];
+    let lex_size = compiler.lexicon.len();
+    for &(_, _, class, _) in compiler.lexicon.values() {
+        if (class as usize) < class_counts.len() {
+            class_counts[class as usize] += 1;
+        }
+    }
+    let class_names = ["SUBST", "VERBO", "ADJ", "ART/PRON", "ADV", "PREP/CONJ", "PONT", "OUTRO"];
+    println!("\n  Distribuição de classes ({} entradas no léxico):", lex_size);
+    for (i, name) in class_names.iter().enumerate() {
+        let pct = class_counts[i] as f32 / lex_size as f32 * 100.0;
+        println!("    {}: {} ({:.1}%)", name, class_counts[i], pct);
+    }
     println!();
 
-    // ─── FASE 6: Gerar texto com GRAPH modulation ───
-    println!("▸ FASE 6: Gerando texto com GRAPH modulation...");
+    // ─── FASE 7: Gerar texto com GRAPH modulation ───
+    println!("▸ FASE 7: Gerando texto com GRAPH modulation...");
 
     // Sementes variadas
     let seeds = vec![
@@ -330,8 +362,8 @@ fn main() {
 
     println!();
 
-    // ─── FASE 7: Salvar ───
-    println!("▸ FASE 7: Salvando gramática treinada...");
+    // ─── FASE 8: Salvar ───
+    println!("▸ FASE 8: Salvando gramática treinada...");
 
     let bin_path = "training/wikipedia_grammar.bin";
     let gguf_path = "training/wikipedia_grammar.gguf";
@@ -344,8 +376,8 @@ fn main() {
 
     println!();
 
-    // ─── FASE 8: Treinar SNN com dados reais ───
-    println!("▸ FASE 8: Treinando SNN com dados reais...");
+    // ─── FASE 9: Treinar SNN com dados reais ───
+    println!("▸ FASE 9: Treinando SNN com dados reais...");
 
     // Construir SNN a partir da gramática treinada
     grammar.build_snn();
