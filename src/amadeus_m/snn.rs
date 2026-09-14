@@ -369,6 +369,71 @@ impl SpikingNetwork {
     }
 
     // ─── Treinamento iterativo STDP ───
+
+    /// STDP de 3 fatores: pré × pós × modulador
+    /// modulator: sinal de fricção/reforço (0.0=fricção alta, 1.0=reforço)
+    pub fn stdp_train_3factor(
+        &mut self,
+        input_spikes: &[SpikeTrain],
+        target_output: usize,
+        learning_rate: f32,
+        modulator: f32,
+    ) {
+        let output_spike_times = self.run(input_spikes);
+
+        let tau_plus = 20.0;
+        let tau_minus = 20.0;
+        let a_plus = learning_rate * modulator; // Modulador escala LTP
+        let a_minus = learning_rate * 0.85 * (1.0 - modulator * 0.5); // LTD reduzido com reforço
+
+        // Hidden → Output (3-factor)
+        for (h, nh) in self.hidden_neurons.iter().enumerate() {
+            if !nh.fired { continue; }
+
+            if let Some(&spike_time) = output_spike_times.get(target_output)
+                .and_then(|times| times.first())
+            {
+                let dt_spike = spike_time as f32 - nh.last_spike_time as f32;
+
+                if dt_spike > 0.0 {
+                    let delta_w = a_plus * (-dt_spike / tau_plus).exp();
+                    for o in 0..self.synapses_ho[h].len() {
+                        self.synapses_ho[h][o] += delta_w;
+                        self.synapses_ho[h][o] = self.synapses_ho[h][o].clamp(-1.0, 1.0);
+                    }
+                } else if dt_spike < 0.0 {
+                    let delta_w = -a_minus * (dt_spike / tau_minus).exp();
+                    for o in 0..self.synapses_ho[h].len() {
+                        self.synapses_ho[h][o] += delta_w;
+                        self.synapses_ho[h][o] = self.synapses_ho[h][o].clamp(-1.0, 1.0);
+                    }
+                }
+            }
+        }
+
+        // Input → Hidden (3-factor)
+        for (i, ni) in self.input_neurons.iter().enumerate() {
+            if !ni.fired { continue; }
+
+            for (h, nh) in self.hidden_neurons.iter().enumerate() {
+                if !nh.fired { continue; }
+
+                let dt_spike = nh.last_spike_time as f32 - ni.last_spike_time as f32;
+
+                if dt_spike > 0.0 {
+                    let delta_w = a_plus * (-dt_spike / tau_plus).exp();
+                    self.synapses_ih[i][h] += delta_w;
+                    self.synapses_ih[i][h] = self.synapses_ih[i][h].clamp(-1.0, 1.0);
+                } else if dt_spike < 0.0 {
+                    let delta_w = -a_minus * (dt_spike / tau_minus).exp();
+                    self.synapses_ih[i][h] += delta_w;
+                    self.synapses_ih[i][h] = self.synapses_ih[i][h].clamp(-1.0, 1.0);
+                }
+            }
+        }
+    }
+
+    /// Treinamento iterativo STDP
     /// Treina o SNN em múltiplas épocas para classificação POS (7 classes)
     /// Retorna (época, acurácia_top1, acurácia_top3) por época
     pub fn iterative_train(
@@ -433,9 +498,12 @@ impl SpikingNetwork {
                     }
                 }
 
-                // STDP: target = neuron da classe correta
+                // STDP de 3 fatores: modulador = confiança da predição
                 if let Some(target_idx) = self.output_labels.iter().position(|&id| id == target_class) {
-                    self.stdp_train(&trains, target_idx, learning_rate);
+                    // Modulador: 1.0 se acertou (reforço), 0.3 se errou (fricção)
+                    let predicted_class = scores.first().map(|(c, _)| *c).unwrap_or(0);
+                    let modulator = if predicted_class == target_class { 1.0 } else { 0.3 };
+                    self.stdp_train_3factor(&trains, target_idx, learning_rate, modulator);
                 }
             }
 
