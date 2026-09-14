@@ -1,6 +1,7 @@
 use amadeus::amadeus_m::triple_grammar::TripleGrammar;
 use amadeus::amadeus_m::token7::Token7;
 use amadeus::amadeus_m::hmm::{HmmPosTagger, TAG_SUBST, TAG_VERBO, TAG_ADJ, TAG_ART, TAG_ADV, TAG_PREP, TAG_CONJ, TAG_PONT};
+use amadeus::amadeus_m::morph_vocab::AffixVocabulary;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -251,14 +252,60 @@ fn main() {
     println!("  Treinamento concluído");
     println!();
 
-    // ─── FASE 5: Construir GRAPH embeddings ───
-    println!("▸ FASE 5: Construindo GRAPH embeddings (PPMI 32 dims)...");
+    // ─── FASE 5: Construir GRAPH embeddings morfológicos ───
+    println!("▸ FASE 5: Construindo GRAPH embeddings morfológicos...");
 
-    // Co-ocorrência com PMI para embeddings semânticos reais
+    // Criar vocabulário de afixos
+    let morph_vocab = AffixVocabulary::new();
+    let stats = morph_vocab.stats();
+    println!("  {}", stats);
+
+    // Coletar todas as palavras do léxico
+    let word_list: Vec<String> = compiler.lexicon.keys().cloned().collect();
+
+    // Embeddings morfológicos: XOR dos bits dos afixos
     let mut graph: HashMap<u32, u32> = HashMap::new();
-    let mut rng = fastrand::Rng::with_seed(42);
 
-    let window_size = 5; // Janela maior = mais contexto semântico
+    for (word, &(lex_id, _, _, _)) in &compiler.lexicon {
+        if lex_id == 0 { continue; }
+
+        // Decompor palavra em afixos
+        let (prefix, root, suffix) = morph_vocab.decompose(word);
+
+        // Calcular embedding como XOR dos bits dos afixos
+        let mut embedding: u32 = 0;
+        if let Some(id) = prefix {
+            if let Some(&bits) = morph_vocab.affix_bits.get(&id) {
+                embedding ^= bits;
+            }
+        }
+        if let Some(id) = root {
+            if let Some(&bits) = morph_vocab.affix_bits.get(&id) {
+                embedding ^= bits;
+            }
+        }
+        if let Some(id) = suffix {
+            if let Some(&bits) = morph_vocab.affix_bits.get(&id) {
+                embedding ^= bits;
+            }
+        }
+
+        // Fallback: hash da palavra inteira
+        if embedding == 0 {
+            let mut hash: u32 = 0x811c9dc5;
+            for byte in word.bytes() {
+                hash ^= byte as u32;
+                hash = hash.wrapping_mul(0x01000193);
+            }
+            embedding = hash;
+        }
+
+        graph.insert(lex_id, embedding);
+    }
+
+    // Adicionar embeddings PPMI para palavras sem afixos conhecidos
+    // (usar janela=5, top-64 vizinhos como antes)
+    let window_size = 5;
     let mut cooccurrence: HashMap<(u32, u32), f32> = HashMap::new();
     let mut word_freq: HashMap<u32, f32> = HashMap::new();
     let mut total_pairs = 0.0f32;
@@ -273,7 +320,6 @@ fn main() {
             let context = window[i];
             if context.lex == 0 { continue; }
 
-            // Peso decrescente com distância (closer = more important)
             let dist = (i as i32 - window_size as i32 / 2).unsigned_abs() as f32;
             let weight = 1.0 / (1.0 + dist);
 
@@ -287,23 +333,21 @@ fn main() {
         }
     }
 
-    // PMI: Pointwise Mutual Information
-    // PMI(a,b) = log2(P(a,b) / (P(a) * P(b)))
-    // High PMI = words that co-occur more than expected by chance
+    // PMI
     let mut pmi_scores: HashMap<(u32, u32), f32> = HashMap::new();
     for (&(a, b), &count) in &cooccurrence {
         let p_ab = count / total_pairs;
         let p_a = word_freq.get(&a).copied().unwrap_or(1.0) / total_pairs;
         let p_b = word_freq.get(&b).copied().unwrap_or(1.0) / total_pairs;
         let pmi = (p_ab / (p_a * p_b)).max(1e-10).log2();
-        // Positive PMI (PPMI): clamp negatives to 0
         if pmi > 0.0 {
             pmi_scores.insert((a, b), pmi);
         }
     }
 
-    // Embeddings: 32 dims via PPMI (Hamming com informação semântica real)
+    // Projeção aleatória para PPMI
     let n_dims = 32;
+    let mut rng = fastrand::Rng::with_seed(42);
     let mut projection: Vec<Vec<i8>> = Vec::new();
     for _ in 0..n_dims {
         let mut row: Vec<i8> = Vec::new();
@@ -318,26 +362,29 @@ fn main() {
     lex_ids.sort();
     lex_ids.dedup();
 
-    // Inverter PPMI: lex_id → [(outro, pmi)]
+    // Inverter PPMI
     let mut lex_ppmi: HashMap<u32, Vec<(u32, f32)>> = HashMap::new();
     for (&(a, b), &pmi) in &pmi_scores {
         lex_ppmi.entry(a).or_default().push((b, pmi));
         lex_ppmi.entry(b).or_default().push((a, pmi));
     }
 
+    // Combinar: morphological XOR PPMI para palavras com poucos afixos
     for &lex_id in &lex_ids {
-        let mut embedding: u32 = 0;
+        // Se já tem embedding morfológico, pular
+        if graph.contains_key(&lex_id) {
+            continue;
+        }
 
+        let mut embedding: u32 = 0;
         if let Some(neighbors) = lex_ppmi.get(&lex_id) {
-            // Top-K vizinhos por PPMI (manter só os mais relevantes)
             let mut top_neighbors = neighbors.clone();
             top_neighbors.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-            top_neighbors.truncate(64); // top 64 por embedding
+            top_neighbors.truncate(64);
 
             for &(other, ppmi) in &top_neighbors {
                 if (other as usize) < projection[0].len() {
                     for dim in 0..n_dims {
-                        // PPMI pondera a projeção
                         if projection[dim][other as usize] as f32 * ppmi > 0.0 {
                             embedding ^= 1 << dim;
                         }
@@ -346,14 +393,44 @@ fn main() {
             }
         }
 
-        graph.insert(lex_id, embedding);
+        if embedding != 0 {
+            graph.insert(lex_id, embedding);
+        }
     }
 
     // Copiar GRAPH para a gramática
     grammar.graph = graph.clone();
-    grammar.graph_alpha = 0.3; // Peso da modulação semântica
+    grammar.graph_alpha = 0.3;
 
-    println!("  GRAPH: {} embeddings criados (janela=5, top-64 vizinhos)", graph.len());
+    // Mostrar estatísticas de decomposição
+    let mut decomposed_count = 0;
+    let mut total_count = 0;
+    for word in &word_list {
+        if let Some(&(lex_id, _, _, _)) = compiler.lexicon.get(word) {
+            if lex_id == 0 { continue; }
+            total_count += 1;
+            let (p, r, s) = morph_vocab.decompose(word);
+            if p.is_some() || r.is_some() || s.is_some() {
+                decomposed_count += 1;
+            }
+        }
+    }
+
+    println!("  GRAPH: {} embeddings (morfológicos + PPMI)", graph.len());
+    println!("  Decomposição: {}/{} palavras ({:.1}%)",
+        decomposed_count, total_count,
+        decomposed_count as f32 / total_count as f32 * 100.0);
+
+    // Mostrar exemplos de decomposição
+    println!("  Exemplos de decomposição:");
+    for word in &["invisível", "bonitas", "correndo", "brasileiro", "desconhecido"] {
+        let (p, r, s) = morph_vocab.decompose(word);
+        let p_str = p.map(|id| morph_vocab.id_to_affix[&id].as_str()).unwrap_or("-");
+        let r_str = r.map(|id| morph_vocab.id_to_affix[&id].as_str()).unwrap_or("-");
+        let s_str = s.map(|id| morph_vocab.id_to_affix[&id].as_str()).unwrap_or("-");
+        println!("    {} = {} + {} + {}", word, p_str, r_str, s_str);
+    }
+
     println!();
 
     // ─── FASE 6: Métricas ───
