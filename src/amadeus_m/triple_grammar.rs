@@ -709,6 +709,71 @@ impl TripleGrammar {
         all_tokens
     }
 
+    /// Geração com planejamento retórico: decide estrutura antes de gerar tokens
+    pub fn generate_text_rhetorical(&mut self, seed_lex: u32, n_sentences: usize) -> Vec<Token7> {
+        let mut all_tokens: Vec<Token7> = Vec::new();
+        let mut planner = crate::amadeus_m::rhetoric::RhetoricPlanner::new();
+
+        // Inicializar tópico com seed
+        if let Some(&g) = self.graph.get(&seed_lex) {
+            self.update_topic(g);
+        }
+
+        for sent_i in 0..n_sentences {
+            // 1. Decidir papel retórico
+            let role = planner.next_role();
+
+            // 2. Gerar esqueleto de sentença
+            let skeleton = planner.plan_sentence();
+
+            // 3. Gerar tokens seguindo o esqueleto
+            let phrase = self.generate_with_skeleton(&skeleton, role, 20);
+
+            // 4. Atualizar tópico
+            for t in &phrase {
+                if let Some(&g) = self.graph.get(&t.lex) {
+                    self.update_topic(g);
+                }
+            }
+
+            all_tokens.extend(phrase);
+        }
+
+        all_tokens
+    }
+
+    /// Gerar sentença seguindo esqueleto retórico
+    fn generate_with_skeleton(
+        &mut self,
+        skeleton: &[Option<u8>],
+        _role: crate::amadeus_m::rhetoric::RhetoricRole,
+        max_len: usize,
+    ) -> Vec<Token7> {
+        let mut out: Vec<Token7> = Vec::new();
+
+        for &expected_class in skeleton.iter() {
+            if out.len() >= max_len { break; }
+
+            let cls = expected_class.unwrap_or(0);
+
+            // Usar sample_lex_full com candidate=0 (sem preferência)
+            let morph = (cls as u16) << 8;
+            let syn_func: u8 = 0;
+            let style: u16 = 0;
+
+            let lex = self.sample_lex_full(morph, syn_func, style, cls, 0);
+
+            if lex != 0 {
+                let token = Token7::new(lex, morph)
+                    .with_syn(0, syn_func)
+                    .with_style(style);
+                out.push(token);
+            }
+        }
+
+        out
+    }
+
     // ─── Rastreio de profundidade de cláusula ───
     // Heurística: PREP/ADV com syn_func de subordinação → push,
     // PONT final → pop. Durante treino, computamos do golden.

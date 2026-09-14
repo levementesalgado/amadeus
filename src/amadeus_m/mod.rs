@@ -29,6 +29,7 @@ pub mod embedding_compressor;
 pub mod dual_loader;
 pub mod hmm;
 pub mod morph_vocab;
+pub mod rhetoric;
 
 pub use config::AmadeusMConfig;
 pub use model::AmadeusMModel;
