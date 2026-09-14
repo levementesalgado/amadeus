@@ -1,5 +1,48 @@
 # AMADEUS Progress Log
 
+## 2026-09-14 — v6.2: SVD + Recurrent SNN + 3-Factor STDP
+
+### Melhorias implementadas
+1. **Style field no compilador**: `classify_style()` determina formal/informal/neutro por lexema
+   - T3: 1055→1350 (+28% cobertura)
+   - Critérios: sufixos técnicos, abreviações, diminutivos, termos jurídicos/médicos
+
+2. **GRAPH via SVD**: power iteration sobre matriz de co-ocorrência PPMI
+   - Substitui random projection por fatoração real
+   - Top-2000 palavras recebem embeddings SVD (32-bit quantizados)
+   - Gram-Schmidt orthogonalization
+
+3. **SNN recorrente**: `infer_snn_recurrent()` mantém membrana entre tokens
+   - Sem reset entre chamadas
+   - Memória implícita no potencial de membrana
+   - Dependência de longo alcance sem aumentar neurons
+
+4. **3-Factor STDP**: `stdp_train_3factor(input, target, lr, modulator)`
+   - modulator=1.0 quando acerta (reforço)
+   - modulator=0.3 quando erra (fricção)
+   - LTP escalado pelo modulador, LTD reduzido quando confiante
+
+### Métricas finais
+
+| Componente | v6.0 | v6.2 |
+|------------|------|------|
+| T3 | 1.055 | **1.350** |
+| T2 | 3.903 | **4.800** |
+| GRAPH | 50.030 (PPMI) | **2.000 (SVD)** |
+| SNN Top-1 | 82.0% | **89.2%** |
+| SNN Top-3 | 85.6% | **91.2%** |
+
+### Commits
+```
+1844b15 — 3-factor STDP (friction as reinforcement signal)
+75c412c — recurrent SNN (membrane persists between tokens)
+94d1b53 — GRAPH via SVD power iteration
+34b0dd0 — populate style field (28% T3 increase)
+c18b7f6 — documentation update v6.2
+```
+
+---
+
 ## 2026-09-14 — v6.0: SNN Re-architected, Corpus Misto, Phrase Generation
 
 ### Resultados
