@@ -645,6 +645,59 @@ fn main() {
 
     grammar.train_snn_iterative(10, 0.001);
 
+    // ─── FASE 11: Self-play ───
+    println!();
+    println!("▸ FASE 11: Self-play com filtro local...");
+
+    let filter = amadeus::amadeus_m::self_play::SelfPlayFilter::new(grammar.graph.clone());
+    let mut n_accepted = 0;
+    let mut n_total = 0;
+    let mut accepted_tokens: Vec<Token7> = Vec::new();
+    let mut total_score = 0.0f32;
+
+    // Gerar 100 textos e filtrar
+    for i in 0..100 {
+        let seed_lex = 1 + (i as u32 % 10); // seeds variados
+        let generated = grammar.generate_text(seed_lex, 3);
+        let result = filter.evaluate(&generated);
+
+        total_score += result.score;
+        n_total += 1;
+        if result.passed {
+            n_accepted += 1;
+            accepted_tokens.extend(generated.clone());
+        }
+
+        // Log dos primeiros 10
+        if i < 10 {
+            let words: Vec<&str> = generated.iter()
+                .filter(|t| t.lex != 0)
+                .filter_map(|t| reverse_owned.get(&t.lex).map(|s| s.as_str()))
+                .collect();
+            println!("    [{}] {} (score={:.2} {})",
+                i, words.join(" "), result.score,
+                if result.passed { "✓" } else { "✗" });
+        }
+    }
+
+    println!("  Gerados: {}", n_total);
+    println!("  Aprovados: {} ({:.0}%)", n_accepted, n_accepted as f32 / n_total as f32 * 100.0);
+    println!("  Score médio: {:.2}", total_score / n_total as f32);
+    println!("  Tokens aceitos: {}", accepted_tokens.len());
+
+    // Retreinar gramática com textos aceitos
+    if !accepted_tokens.is_empty() {
+        println!("  Retreinando gramática com {} tokens self-play...", accepted_tokens.len());
+        grammar.train(&accepted_tokens);
+    }
+
+    // Retreinar SNN com dados expandidos
+    if accepted_tokens.len() > 100 {
+        println!("  Retreinando SNN...");
+        grammar.build_snn();
+        grammar.train_snn_iterative(5, 0.001);
+    }
+
     println!();
     println!("═══════════════════════════════════════════════════════════");
     println!("  TREINAMENTO MISTO COMPLETO");
