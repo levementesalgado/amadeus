@@ -125,15 +125,80 @@ impl SimpleCompiler {
             _ => (0, (id as u16).wrapping_mul(0x9E37) & 0x00FF),
         };
 
-        let style = word_style(id, class);
+        let style = classify_style(word, class);
         self.lexicon.insert(word.to_string(), (id, morph_bits | (class as u16), class, style));
         (id, morph_bits | (class as u16), class, style)
     }
 }
 
-fn word_style(id: u32, class: u8) -> u16 {
-    let hash = (id as u16).wrapping_mul(0x9E37).wrapping_add(class as u16 * 0x7C5);
-    hash & 0x3F
+/// Classificar estilo de uma palavra: 0=neutro, 1=formal, 2=informal
+/// Baseado em: comprimento, padrões, sufixos, domínio
+fn classify_style(word: &str, class: u8) -> u16 {
+    let w = word.to_lowercase();
+    let len = w.len();
+
+    // ─── INFORMAL (2) ───
+    // Abreviações coloquiais
+    if w == "vc" || w == "voc" || w == "tb" || w == "tbm" || w == "msg"
+        || w == "qdo" || w == "pq" || w == "ai" || w == "ah" || w == "oh"
+        || w == "né" || w == "né" || w == "tô" || w == "tá" || w == "flw"
+        || w == "blz" || w == "vd" || w == "q" || w == "n" || w == "s"
+        || w == "pf" || w == "obg" || w == "vlw" || w == "sassudo"
+        || w == "mano" || w == "cara" || w == "tipo" || w == "bicho"
+        || w == "caraca" || w == "eita" || w == "oxe" || w == "uai"
+    {
+        return 2;
+    }
+
+    // Diminutivos coloquiais (informal)
+    if w.ends_with("inho") || w.ends_with("inha") || w.ends_with("ito") || w.ends_with("ita") {
+        if len <= 8 {
+            return 2;
+        }
+    }
+
+    // Gírias / vocabulary coloquial
+    if w == "trampo" || w == "moleque" || w == "mina" || w == "zica"
+        || w == "balada" || w == "rolê" || w == "suave" || w == "massa"
+        || w == "da hora" || w == "top" || w == "irado" || w == "sinistro"
+    {
+        return 2;
+    }
+
+    // ─── FORMAL (1) ───
+    // Sufixos formais / técnicos
+    if w.ends_with("ão") && (class == 0 || class == 2) && len > 8 {
+        return 1; // substantivos/adjetivos longos em -ão tendem a ser formais
+    }
+
+    // Termos técnicos/científicos
+    if w.contains("olog") || w.contains("ismo") && len > 8
+        || w.ends_with("idade") && len > 6
+        || w.ends_with("ário") || w.ends_with("eiro") && len > 7
+        || w.ends_with("ância") || w.ends_with("ência")
+        || w.ends_with("ível") || w.ends_with("ável")
+    {
+        return 1;
+    }
+
+    // Palavras muito longas tendem a ser formais
+    if len > 12 {
+        return 1;
+    }
+
+    // Termos de domínio formal (jurídico, médico, acadêmico)
+    if w.starts_with("art") || w.starts_with("parágrafo") || w.starts_with("alínea")
+        || w.starts_with("inciso") || w.starts_with("cláusula")
+        || w.starts_with("diagnóstico") || w.starts_with("prognóstico")
+        || w.starts_with("tratamento") || w.starts_with("prescrição")
+        || w.starts_with("norma") || w.starts_with("regulament")
+    {
+        return 1;
+    }
+
+    // ─── NEUTRO (0) ───
+    // Maioria das palavras
+    0
 }
 
 fn main() {
