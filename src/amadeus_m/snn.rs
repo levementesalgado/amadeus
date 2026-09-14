@@ -298,7 +298,7 @@ impl SpikingNetwork {
     }
 
     // ─── Treinamento iterativo STDP ───
-    /// Treina o SNN em múltiplas épocas com exemplos do grammar
+    /// Treina o SNN em múltiplas épocas para classificação POS (7 classes)
     /// Retorna (época, acurácia_top1, acurácia_top3) por época
     pub fn iterative_train(
         &mut self,
@@ -311,22 +311,21 @@ impl SpikingNetwork {
         let mut results = Vec::new();
         let mut rng = fastrand::Rng::with_seed(42);
 
-        // Extrair exemplos de treinamento do grammar
+        // Extrair exemplos: (morph, syn_func, style, class_id)
         let mut training_examples: Vec<(u16, u8, u16, u32)> = Vec::new();
-        for (&(morph, syn_func, style), candidates) in grammar_lexicon {
-            for &lex_id in candidates.keys() {
-                training_examples.push((morph, syn_func, style, lex_id));
-            }
+        for (&(morph, syn_func, style), _candidates) in grammar_lexicon {
+            let class_id = (morph & 0x7) as u32;
+            training_examples.push((morph, syn_func, style, class_id));
         }
 
         if training_examples.is_empty() {
             return results;
         }
 
-        println!("    Exemplos de treinamento: {}", training_examples.len());
+        println!("    Exemplos de treinamento: {} (classificação POS)", training_examples.len());
 
         for epoch in 0..epochs {
-            // Embaralhar exemplos (Fisher-Yates com fastrand)
+            // Fisher-Yates shuffle
             let n = training_examples.len();
             for i in (1..n).rev() {
                 let j = rng.usize(0..=i);
@@ -338,36 +337,33 @@ impl SpikingNetwork {
             let mut correct_top3 = 0usize;
 
             for idx in 0..n_samples {
-                let (morph, syn_func, style, target_lex) = training_examples[idx];
+                let (morph, syn_func, style, target_class) = training_examples[idx];
 
-                // Criar spike trains de entrada
                 let trains = enc.encode(morph, syn_func, style, self.tsteps, &mut rng);
-
-                // Rodar SNN
                 let output_spikes = self.run(&trains);
 
-                // Encontrar rank do target
+                // Scores das 7 classes
                 let mut scores: Vec<(u32, f32)> = self.output_neurons.iter().enumerate()
                     .map(|(i, n)| {
-                        let lex_id = self.output_labels[i];
+                        let class_id = self.output_labels[i];
                         let spike_count = output_spikes.get(i).map(|s| s.len()).unwrap_or(0) as f32;
                         let potential: f32 = n.spike_times.iter().map(|&t| (-(t as f32) / 5.0).exp()).sum();
-                        (lex_id, spike_count + potential)
+                        (class_id, spike_count + potential)
                     })
                     .collect();
                 scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
 
-                // Verificar se target está no top-1 e top-3
-                for (rank, &(lex_id, _)) in scores.iter().take(3).enumerate() {
-                    if lex_id == target_lex {
+                // Verificar acurácia
+                for (rank, &(class_id, _)) in scores.iter().take(3).enumerate() {
+                    if class_id == target_class {
                         if rank == 0 { correct_top1 += 1; }
                         correct_top3 += 1;
                         break;
                     }
                 }
 
-                // Treinar com STDP (target = output neuron do target_lex)
-                if let Some(target_idx) = self.output_labels.iter().position(|&id| id == target_lex) {
+                // STDP: target = neuron da classe correta
+                if let Some(target_idx) = self.output_labels.iter().position(|&id| id == target_class) {
                     self.stdp_train(&trains, target_idx, learning_rate);
                 }
             }
@@ -494,50 +490,32 @@ pub fn build_snn_from_grammar(
     let enc = MorphEncoding::new();
     let n_input = enc.total;
 
-    // Coletar todos os lex_ids únicos
-    let mut all_lex_ids: Vec<u32> = std::collections::BTreeSet::new()
-        .into_iter()
-        .chain(lexicon_exact.values().flat_map(|m| m.keys().copied()))
-        .chain(lexicon_css.values().flat_map(|m| m.keys().copied()))
-        .chain(lexicon_cs.values().flat_map(|m| m.keys().copied()))
-        .chain(lexicon_cst.values().flat_map(|m| m.keys().copied()))
-        .chain(lexicon_class.values().flat_map(|m| m.keys().copied()))
-        .collect();
-    all_lex_ids.sort();
-    all_lex_ids.dedup();
-    let n_out = all_lex_ids.len();
+    // 7 classes POS como outputs (SUBST=0, VERBO=1, ADJ=2, ART=3, ADV=4, PREP/CONJ=5, PONT=6)
+    let n_out = 7;
+    let class_labels: Vec<u32> = (0..n_out as u32).collect();
 
-    // Hidden layer: uma entrada por T3 key (morph, syn, style) + uma por classe
-    // Isso dá discriminação real ao invés de pesos diluídos
-    let n_class_neurons = 7; // 7 classes morfológicas
-    let n_t3_neurons = lexicon_exact.len().min(256); // limitar para eficiência
+    // Hidden layer: T3 keys + classe neurons
+    let n_class_neurons = 7;
+    let n_t3_neurons = lexicon_exact.len().min(256);
     let n_hidden = n_class_neurons + n_t3_neurons;
 
-    let mut net = SpikingNetwork::new(n_input, n_hidden, all_lex_ids.clone(), tau, threshold, refrac, dt, tsteps);
+    let mut net = SpikingNetwork::new(n_input, n_hidden, class_labels, tau, threshold, refrac, dt, tsteps);
 
-    let lex_index: HashMap<u32, usize> = all_lex_ids.iter().enumerate().map(|(i, &id)| (id, i)).collect();
-
-    // ── Pesos I→H: cada hidden neuron responde a uma combinação específica ──
-
-    // Neurônios de classe (primeiros 7): respondem a features daquela classe
+    // ── Pesos I→H: classe neurons ──
     for class_id in 0..n_class_neurons {
         let h_idx = class_id;
-        // Conexão forte da feature de classe correspondente
         net.synapses_ih[enc.class_start + class_id][h_idx] = 0.5;
-        // Conexões moderadas de outras features da mesma classe
         net.synapses_ih[enc.gender_start][h_idx] = 0.1;
         net.synapses_ih[enc.gender_start + 1][h_idx] = 0.1;
         net.synapses_ih[enc.number_start][h_idx] = 0.1;
         net.synapses_ih[enc.number_start + 1][h_idx] = 0.1;
     }
 
-    // Neurônios T3 (a partir de n_class_neurons): cada um associado a uma T3 key
+    // ── Pesos I→H: T3 neurons ──
     let t3_keys: Vec<&(u16, u8, u16)> = lexicon_exact.keys().collect();
     for (t3_idx, &key) in t3_keys.iter().enumerate().take(n_t3_neurons) {
         let h_idx = n_class_neurons + t3_idx;
         let (morph, syn_func, style) = *key;
-
-        // Conectar features relevantes a este hidden neuron
         let class_id = (morph & 0x7) as usize;
         if class_id < enc.class_count {
             net.synapses_ih[enc.class_start + class_id][h_idx] = 0.4;
@@ -556,24 +534,19 @@ pub fn build_snn_from_grammar(
         net.synapses_ih[enc.style_start + style_id][h_idx] = 0.2;
     }
 
-    // ── Pesos H→O: hidden neuron → lex_ids da sua T3 key ──
-    for (t3_idx, (&key, candidates)) in lexicon_exact.iter().enumerate().take(n_t3_neurons) {
-        let h_idx = n_class_neurons + t3_idx;
-        let total: f32 = candidates.values().sum();
-        if total > 0.0 {
-            for (&lex_id, &count) in candidates {
-                if let Some(&out_idx) = lex_index.get(&lex_id) {
-                    net.synapses_ho[h_idx][out_idx] = count / total * 0.5;
-                }
-            }
-        }
+    // ── Pesos H→O: cada hidden neuron → classe correspondente ──
+    // Neurônios de classe → sua própria classe
+    for class_id in 0..n_class_neurons {
+        net.synapses_ho[class_id][class_id] = 0.8;
     }
 
-    // Neurônios de classe → lex_ids daquela classe (fallback)
-    for (lex_id, &cls) in lex_index.iter() {
-        let class_id = (cls as usize).min(n_class_neurons - 1);
-        if let Some(&out_idx) = lex_index.get(lex_id) {
-            net.synapses_ho[class_id][out_idx] += 0.1;
+    // T3 neurons → classe do seu morph
+    for (t3_idx, &key) in t3_keys.iter().enumerate().take(n_t3_neurons) {
+        let h_idx = n_class_neurons + t3_idx;
+        let (morph, _, _) = *key;
+        let class_id = (morph & 0x7) as usize;
+        if class_id < n_out {
+            net.synapses_ho[h_idx][class_id] = 0.5;
         }
     }
 
@@ -592,21 +565,17 @@ pub fn infer_snn(
 ) -> Vec<(u32, f32)> {
     let trains = enc.encode(morph, syn_func, style, net.tsteps, rng);
 
-    // Usar potencial de membrana acumulado ao invés de só spikes
-    // Isso permite sub-threshold discrimination
     let mut output_potentials = vec![0.0f32; net.output_neurons.len()];
     let mut output_spikes = vec![0u32; net.output_neurons.len()];
 
     net.reset();
 
     for t in 0..net.tsteps {
-        // Input layer
         for (i, train) in trains.iter().enumerate() {
             let spike_in = if t < train.timesteps && train.spikes[t] { 1.0 } else { 0.0 };
             net.input_neurons[i].step(spike_in, net.dt, t);
         }
 
-        // Input → Hidden
         let mut hidden_input = vec![0.0f32; net.hidden_neurons.len()];
         for (i, ni) in net.input_neurons.iter().enumerate() {
             if ni.fired {
@@ -619,7 +588,6 @@ pub fn infer_snn(
             nh.step(hidden_input[h], net.dt, t);
         }
 
-        // Hidden → Output
         let mut output_input = vec![0.0f32; net.output_neurons.len()];
         for (h, nh) in net.hidden_neurons.iter().enumerate() {
             if nh.fired {
@@ -630,7 +598,6 @@ pub fn infer_snn(
         }
         for (o, no) in net.output_neurons.iter_mut().enumerate() {
             no.step(output_input[o], net.dt, t);
-            // Acumular potencial (mesmo sub-threshold)
             output_potentials[o] += output_input[o];
             if no.fired {
                 output_spikes[o] += 1;
@@ -638,7 +605,7 @@ pub fn infer_snn(
         }
     }
 
-    // Score: potencial acumulado + bônus por spikes
+    // Score: potencial + spikes → 7 classes POS
     let scores: Vec<(u32, f32)> = output_potentials.iter().enumerate().map(|(i, &pot)| {
         let spike_bonus = output_spikes[i] as f32 * 2.0;
         let score = pot + spike_bonus;
@@ -663,32 +630,22 @@ pub fn snn_sample_lex(
     exploration_rate: f32,
     rng: &mut fastrand::Rng,
 ) -> u32 {
-    let rankings = infer_snn(net, enc, morph, syn_func, style, rng);
+    // SNN retorna probabilidades de classe POS (7 classes)
+    let class_scores = infer_snn(net, enc, morph, syn_func, style, rng);
 
     if rng.f32() < exploration_rate {
-        if !rankings.is_empty() {
-            let idx = rng.usize(0..rankings.len());
-            return rankings[idx].0;
+        if !class_scores.is_empty() {
+            let idx = rng.usize(0..class_scores.len());
+            return class_scores[idx].0;
         }
         return candidate;
     }
 
-    // Buscar candidato nas rankings
-    if let Some(&(_, score)) = rankings.iter().find(|(id, _)| *id == candidate) {
-        if score > 0.0 {
-            return candidate;
-        }
+    // Retorna a classe POS mais provável como índice
+    // O caller (grammar) usa isso para modular a distribuição
+    if let Some(&(best_class, _score)) = class_scores.first() {
+        return best_class;
     }
 
-    // Amostragem softmax com temperature
-    if rankings.is_empty() { return candidate; }
-    let temp = temperature.max(0.01) as f64;
-    let sum: f64 = rankings.iter().map(|(_, s)| (*s as f64).powf(1.0 / temp)).sum();
-    if sum <= 0.0 { return candidate; }
-    let mut r = rng.f64() * sum;
-    for &(id, score) in &rankings {
-        r -= (score as f64).powf(1.0 / temp);
-        if r <= 0.0 { return id; }
-    }
-    rankings.last().map(|&(id, _)| id).unwrap_or(candidate)
+    candidate
 }

@@ -429,7 +429,7 @@ fn main() {
     println!();
     println!("▸ FASE 10: Treinamento STDP iterativo...");
 
-    grammar.train_snn_iterative(10, 0.01);
+    grammar.train_snn_iterative(10, 0.001);
 
     println!();
     println!("═══════════════════════════════════════════════════════════");

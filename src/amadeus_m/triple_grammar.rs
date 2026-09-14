@@ -141,9 +141,61 @@ impl TripleGrammar {
 
     pub fn sample_lex_with_snn(&mut self, morph: u16, syn_func: u8, style: u16, cls: u8, candidate: u32) -> u32 {
         if self.snn.is_some() {
-            return self.snn_sample(morph, syn_func, style, candidate);
+            // SNN retorna class_id (0-6) como "melhor classe POS"
+            let predicted_class = self.snn_sample(morph, syn_func, style, candidate) as u8;
+
+            // Usar predicted_class para modular a distribuição do grammar
+            // Mistura: 70% grammar com predicted_class, 30% grammar original
+            return self.sample_lex_modulated(morph, syn_func, style, cls, predicted_class, 0.7, candidate);
         }
         self.sample_lex_full(morph, syn_func, style, cls, candidate)
+    }
+
+    // ─── Amostragem modulada por classe SNN ───
+    pub fn sample_lex_modulated(&mut self, morph: u16, syn_func: u8, style: u16, cls: u8, snn_class: u8, snn_weight: f32, candidate: u32) -> u32 {
+        // Buscar distribuições do grammar
+        let key_exact = (morph, syn_func, style);
+        let key_css = (cls, syn_func, style);
+        let key_cs = (cls, syn_func);
+
+        // Distribuição base (grammar original)
+        let base_dist: Vec<(u32, f32)> = self.lexicon.get(&key_exact)
+            .or(self.lexicon_cls_syn_style.get(&key_css))
+            .or(self.lexicon_cls_syn.get(&key_cs))
+            .or(self.lexicon_class.get(&cls))
+            .map(|m| {
+                let total: f32 = m.values().sum();
+                m.iter().map(|(&id, &count)| (id, count / total)).collect()
+            })
+            .unwrap_or_default();
+
+        if base_dist.is_empty() {
+            return candidate;
+        }
+
+        // Modulação: boost da classe predita pelo SNN
+        let modulated: Vec<(u32, f32)> = base_dist.iter().map(|&(id, prob)| {
+            // Verificar se este lexema pertence à classe predita
+            let lex_class = self.lex_to_class.get(&id).copied().unwrap_or(0);
+            let boost = if lex_class == snn_class { snn_weight } else { 1.0 - snn_weight };
+            (id, prob * boost)
+        }).collect();
+
+        // Amostrar da distribuição modulada
+        let total: f32 = modulated.iter().map(|(_, p)| p).sum();
+        if total <= 0.0 {
+            return candidate;
+        }
+
+        let mut r = self.rng.f32() * total;
+        for &(id, prob) in &modulated {
+            r -= prob;
+            if r <= 0.0 {
+                return id;
+            }
+        }
+
+        modulated.last().map(|&(id, _)| id).unwrap_or(candidate)
     }
 
     // ─── Rastreio de profundidade de cláusula ───
