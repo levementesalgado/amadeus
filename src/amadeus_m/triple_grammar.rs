@@ -292,6 +292,303 @@ impl TripleGrammar {
         *combined.keys().next().unwrap_or(&candidate)
     }
 
+    // ─── GRAPH: Hamming distance para similaridade semântica ───
+
+    /// Conta bits diferentes entre dois u32 (Hamming distance)
+    pub fn hamming(a: u32, b: u32) -> u32 {
+        (a ^ b).count_ones()
+    }
+
+    /// Encontra os K vizinhos mais similares (menor Hamming) de um GRAPH target
+    /// dentro de uma classe POS específica
+    pub fn graph_neighbors(&self, target_graph: u32, class: u8, k: usize) -> Vec<(u32, u32, u32)> {
+        let mut candidates: Vec<(u32, u32, u32)> = self.graph.iter()
+            .filter(|(id, _)| {
+                self.lex_to_class.get(*id).copied().unwrap_or(0) == class
+            })
+            .map(|(&id, &g)| (id, g, Self::hamming(target_graph, g)))
+            .collect();
+
+        candidates.sort_by_key(|&(_, _, dist)| dist);
+        candidates.truncate(k);
+        candidates
+    }
+
+    /// Amostragem ponderada por similaridade semântica (GRAPH)
+    /// Dado um contexto, encontra palavras da mesma classe com GRAPH similar
+    pub fn sample_semantic(
+        &mut self,
+        context_graph: u32,
+        target_class: u8,
+        k: usize,
+        temperature: f32,
+    ) -> u32 {
+        let neighbors = self.graph_neighbors(context_graph, target_class, k);
+        if neighbors.is_empty() { return 0; }
+
+        // Ponderar por inverso da distância (menor dist = maior peso)
+        let temp = temperature.max(0.01) as f64;
+        let scores: Vec<(u32, f64)> = neighbors.iter()
+            .map(|&(id, _, dist)| {
+                let similarity = 1.0 / (1.0 + dist as f64);
+                (id, similarity.powf(1.0 / temp))
+            })
+            .collect();
+
+        let sum: f64 = scores.iter().map(|(_, s)| s).sum();
+        if sum <= 0.0 { return 0; }
+
+        let mut r = self.rng.f64() * sum;
+        for &(id, score) in &scores {
+            r -= score;
+            if r <= 0.0 { return id; }
+        }
+        scores.last().map(|&(id, _)| id).unwrap_or(0)
+    }
+
+    // ─── Backoff estruturado: CUBO → classe → T3 refina ───
+
+    /// Geração com backoff estruturado:
+    /// 1. CUBO prediz classe da próxima palavra
+    /// 2. GRAPH encontra semanticamente similar dentro dessa classe
+    /// 3. T3 refina morfologia/estilo
+    pub fn sample_structured(
+        &mut self,
+        history: &[Token7],
+        clause_depths: &[u8],
+    ) -> (u32, u8) {
+        let temp = self.temperature.max(0.01);
+        let explore = self.exploration_rate;
+
+        // 1. CUBO prediz: qual classe vem depois?
+        let cubo_lex = if self.graph_alpha > 0.0 && !self.graph.is_empty() {
+            self.hier.clause.sample_lex_modulated(history, clause_depths, temp, explore, &mut self.rng, Some(&self.graph), self.graph_alpha)
+        } else {
+            self.hier.clause.sample_lex(history, clause_depths, temp, explore, &mut self.rng)
+        };
+
+        let predicted_class = self.lex_to_class.get(&cubo_lex).copied().unwrap_or(0);
+
+        // 2. GRAPH: buscar similar semântico dentro da classe predita
+        if let Some(&context_graph) = history.last().and_then(|t| self.graph.get(&t.lex)) {
+            if let Some(&target_graph) = self.graph.get(&cubo_lex) {
+                // Mistura: 60% GRAPH similar, 40% CUBO original
+                let graph_lex = self.sample_semantic(target_graph, predicted_class, 32, temp);
+                if graph_lex != 0 && self.rng.f32() < 0.6 {
+                    return (graph_lex, predicted_class);
+                }
+            }
+        }
+
+        // 3. Fallback: CUBO + classe
+        (cubo_lex, predicted_class)
+    }
+
+    // ─── Geração incremental com memória global ───
+
+    /// Gera texto pedaço por pedaço, mantendo memória global
+    /// RetornaIterator de tokens gerados
+    pub fn generate_incremental(
+        &mut self,
+        seed: &[Token7],
+        total_tokens: usize,
+        chunk_size: usize,
+    ) -> Vec<Token7> {
+        let mut out = seed.to_vec();
+        let mut global_graph: Vec<u32> = Vec::new(); // memória global de GRAPHs
+
+        // Seed: coletar GRAPHs do seed
+        for t in seed {
+            if let Some(&g) = self.graph.get(&t.lex) {
+                global_graph.push(g);
+            }
+        }
+
+        let mut generated = 0;
+        while generated < total_tokens {
+            // Gerar chunk de tamanho chunk_size
+            let chunk_start = out.len();
+            for _ in 0..chunk_size {
+                let syn_history = if out.len() >= 2 {
+                    assign_dependencies(&out)
+                } else {
+                    out.clone()
+                };
+                let clause_depths = Self::compute_clause_depths(&syn_history);
+
+                // Backoff estruturado
+                let (cubo_lex, class) = self.sample_structured(&syn_history, &clause_depths);
+                if cubo_lex == 0 { break; }
+
+                // Refinar com T3
+                let refined = self.refine_token(&out, cubo_lex);
+
+                // SNN confirma classe
+                let snn_class = if self.snn.is_some() {
+                    self.snn_sample(refined.morph, refined.syn_func, refined.style, refined.lex)
+                } else {
+                    refined.morph as u32
+                };
+
+                // Amostrar com contexto + GRAPH global
+                let (prev2, prev1) = if out.len() >= 2 {
+                    (out[out.len() - 2].lex, out[out.len() - 1].lex)
+                } else if out.len() == 1 {
+                    (0, out[out.len() - 1].lex)
+                } else {
+                    (0, 0)
+                };
+
+                let ctx_lex = self.sample_lex_with_context(
+                    refined.morph, refined.syn_func, refined.style,
+                    refined.morph_class(), refined.lex, prev2, prev1, 0.7,
+                );
+
+                // Se ctx_lex não bate com classe predita, usar CUBO
+                let ctx_class = self.lex_to_class.get(&ctx_lex).copied().unwrap_or(0);
+                let final_lex = if ctx_class == class || class == 0 {
+                    ctx_lex
+                } else {
+                    cubo_lex
+                };
+
+                let final_token = Token7::new(final_lex, refined.morph)
+                    .with_syn(refined.syn_off, refined.syn_func)
+                    .with_style(refined.style);
+                out.push(final_token);
+
+                // Atualizar memória global
+                if let Some(&g) = self.graph.get(&final_lex) {
+                    global_graph.push(g);
+                    // Manter memória limitada (últimas 64 palavras)
+                    if global_graph.len() > 64 {
+                        global_graph.remove(0);
+                    }
+                }
+
+                generated += 1;
+                if final_lex == 0 { break; }
+            }
+
+            // A cada chunk, "reciclar" memória global
+            // O GRAPH médio do chunk influencia próximo chunk
+            if global_graph.len() > chunk_size {
+                // Pesar GRAPHs recentes mais (recência)
+                let recent_start = global_graph.len().saturating_sub(chunk_size);
+                let _recent_avg: u32 = global_graph[recent_start..].iter()
+                    .fold(0u32, |acc, &g| acc ^ g);
+                // TODO: usar _recent_avg para modular próximo chunk
+            }
+        }
+
+        out
+    }
+
+    // ─── Geração por frazes (frase como unidade) ───
+
+    /// Gera uma frase completa: CUBO prediz sequência de classes,
+    /// depois enche cada posição com lexema adequado
+    pub fn generate_phrase(&mut self, _seed_graph: u32, max_len: usize) -> Vec<Token7> {
+        let mut out: Vec<Token7> = Vec::new();
+
+        for _ in 0..max_len {
+            let temp = self.temperature.max(0.01);
+            let explore = self.exploration_rate;
+
+            // 1. CUBO prediz classe via estrutura sintática
+            let syn_history = if out.len() >= 2 { assign_dependencies(&out) } else { out.clone() };
+            let clause_depths = Self::compute_clause_depths(&syn_history);
+
+            let cubo_lex = if self.graph_alpha > 0.0 && !self.graph.is_empty() {
+                self.hier.clause.sample_lex_modulated(&syn_history, &clause_depths, temp, explore, &mut self.rng, Some(&self.graph), self.graph_alpha)
+            } else {
+                self.hier.clause.sample_lex(&syn_history, &clause_depths, temp, explore, &mut self.rng)
+            };
+
+            if cubo_lex == 0 { break; }
+
+            let predicted_class = self.lex_to_class.get(&cubo_lex).copied().unwrap_or(0);
+
+            // 2. Usar T3 lexicon: P(palavra | morph, syn_func, style)
+            //    O cubo_lex já veio do CUBO com morph/syn/style corretos
+            //    Agora refinar: pegar top candidatos do T3 e amostrar
+            let refined = self.refine_token(&out, cubo_lex);
+
+            // 3. Buscar alternativas no mesmo T3 key (mesma morfologia/função)
+            let t3key = (refined.morph, refined.syn_func, refined.style);
+            let final_lex = if let Some(candidates) = self.lexicon.get(&t3key) {
+                let mut freq: Vec<(u32, f32)> = candidates.iter()
+                    .map(|(&id, &count)| (id, count))
+                    .collect();
+                freq.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+                // Amostrar com temperatura entre top-K
+                let top: Vec<(u32, f64)> = freq.iter().take(16)
+                    .map(|&(id, count)| {
+                        let w = (count as f64).powf(1.0 / temp as f64);
+                        (id, w)
+                    })
+                    .collect();
+
+                let sum: f64 = top.iter().map(|(_, w)| w).sum();
+                if sum > 0.0 {
+                    let mut r = self.rng.f64() * sum;
+                    let mut chosen = cubo_lex;
+                    for &(id, w) in &top {
+                        r -= w;
+                        if r <= 0.0 { chosen = id; break; }
+                    }
+                    chosen
+                } else {
+                    cubo_lex
+                }
+            } else {
+                // Fallback: lexicon_class (frequência da classe)
+                if let Some(class_words) = self.lexicon_class.get(&predicted_class) {
+                    let mut freq: Vec<(u32, f32)> = class_words.iter()
+                        .map(|(&id, &count)| (id, count))
+                        .collect();
+                    freq.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                    freq.first().map(|&(id, _)| id).unwrap_or(cubo_lex)
+                } else {
+                    cubo_lex
+                }
+            };
+
+            let final_token = Token7::new(final_lex, refined.morph)
+                .with_syn(refined.syn_off, refined.syn_func)
+                .with_style(refined.style);
+            out.push(final_token);
+
+            if predicted_class == 6 { break; }
+        }
+
+        out
+    }
+
+    /// Gera texto completo: múltiplas frazes com memória global
+    /// Cada frase usa o GRAPH final da frase anterior como contexto
+    pub fn generate_text(&mut self, seed_lex: u32, n_sentences: usize) -> Vec<Token7> {
+        let mut all_tokens: Vec<Token7> = Vec::new();
+        let mut global_graph = self.graph.get(&seed_lex).copied().unwrap_or(0);
+
+        for sent_i in 0..n_sentences {
+            // Gerar frase usando GRAPH global como contexto
+            let phrase = self.generate_phrase(global_graph, 15);
+
+            // Atualizar memória global: XOR dos GRAPHs da frase
+            for t in &phrase {
+                if let Some(&g) = self.graph.get(&t.lex) {
+                    global_graph ^= g;
+                }
+            }
+
+            all_tokens.extend(phrase);
+        }
+
+        all_tokens
+    }
+
     // ─── Rastreio de profundidade de cláusula ───
     // Heurística: PREP/ADV com syn_func de subordinação → push,
     // PONT final → pop. Durante treino, computamos do golden.

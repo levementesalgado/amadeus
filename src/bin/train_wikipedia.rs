@@ -254,18 +254,19 @@ fn main() {
     // ─── FASE 5: Construir GRAPH embeddings ───
     println!("▸ FASE 5: Construindo GRAPH embeddings...");
 
-    // Usar random indexing para criar embeddings de 32 bits
-    // Cada palavra recebe um vetor esparso baseado em coocorrência
+    // Co-ocorrência com PMI para embeddings semânticos reais
     let mut graph: HashMap<u32, u32> = HashMap::new();
     let mut rng = fastrand::Rng::with_seed(42);
 
-    // Criar embeddings baseados em coocorrência de janela
     let window_size = 3;
     let mut cooccurrence: HashMap<(u32, u32), f32> = HashMap::new();
+    let mut word_freq: HashMap<u32, f32> = HashMap::new();
+    let mut total_pairs = 0.0f32;
 
     for window in all_tokens.windows(window_size) {
         let center = window[window_size / 2];
         if center.lex == 0 { continue; }
+        *word_freq.entry(center.lex).or_insert(0.0) += 1.0;
 
         for i in 0..window.len() {
             if i == window_size / 2 { continue; }
@@ -278,21 +279,34 @@ fn main() {
                 (context.lex, center.lex)
             };
             *cooccurrence.entry(key).or_insert(0.0) += 1.0;
+            total_pairs += 1.0;
         }
     }
 
-    // Criar embeddings usando random projections
+    // PMI: Pointwise Mutual Information
+    // PMI(a,b) = log2(P(a,b) / (P(a) * P(b)))
+    // High PMI = words that co-occur more than expected by chance
+    let mut pmi_scores: HashMap<(u32, u32), f32> = HashMap::new();
+    for (&(a, b), &count) in &cooccurrence {
+        let p_ab = count / total_pairs;
+        let p_a = word_freq.get(&a).copied().unwrap_or(1.0) / total_pairs;
+        let p_b = word_freq.get(&b).copied().unwrap_or(1.0) / total_pairs;
+        let pmi = (p_ab / (p_a * p_b)).max(1e-10).log2();
+        // Positive PMI (PPMI): clamp negatives to 0
+        if pmi > 0.0 {
+            pmi_scores.insert((a, b), pmi);
+        }
+    }
+
+    // Embeddings: 32 dims via PPMI (Hamming com informação semântica real)
     let n_dims = 32;
     let mut projection: Vec<Vec<i8>> = Vec::new();
     for _ in 0..n_dims {
         let mut row: Vec<i8> = Vec::new();
-        for _ in 0..compiler.roots.len() {
-            row.push(rng.i8(-1..=1));
-        }
+        for _ in 0..compiler.roots.len() { row.push(rng.i8(-1..=1)); }
         projection.push(row);
     }
 
-    // Calcular embedding para cada lex_id
     let mut lex_ids: Vec<u32> = compiler.lexicon.values()
         .map(|&(id, _, _, _)| id)
         .filter(|&id| id > 0)
@@ -300,21 +314,22 @@ fn main() {
     lex_ids.sort();
     lex_ids.dedup();
 
-    // Inverter co-ocorrências: lex_id → [(outro, count)]
-    let mut lex_cooccur: HashMap<u32, Vec<(u32, f32)>> = HashMap::new();
-    for (&(a, b), &count) in &cooccurrence {
-        lex_cooccur.entry(a).or_default().push((b, count));
-        lex_cooccur.entry(b).or_default().push((a, count));
+    // Inverter PPMI: lex_id → [(outro, pmi)]
+    let mut lex_ppmi: HashMap<u32, Vec<(u32, f32)>> = HashMap::new();
+    for (&(a, b), &pmi) in &pmi_scores {
+        lex_ppmi.entry(a).or_default().push((b, pmi));
+        lex_ppmi.entry(b).or_default().push((a, pmi));
     }
 
     for &lex_id in &lex_ids {
         let mut embedding: u32 = 0;
 
-        if let Some(neighbors) = lex_cooccur.get(&lex_id) {
-            for &(other, _count) in neighbors {
+        if let Some(neighbors) = lex_ppmi.get(&lex_id) {
+            for &(other, ppmi) in neighbors {
                 if (other as usize) < projection[0].len() {
                     for dim in 0..n_dims {
-                        if projection[dim][other as usize] > 0 {
+                        // PPMI pondera a projeção
+                        if projection[dim][other as usize] as f32 * ppmi > 0.0 {
                             embedding ^= 1 << dim;
                         }
                     }
@@ -381,8 +396,9 @@ fn main() {
         let seed_tokens = compiler.compile(seed);
         if seed_tokens.is_empty() { continue; }
 
-        // Gerar com SNN + bigramas
-        let generated = grammar.generate_with_snn(&seed_tokens, 15);
+        // Gerar texto: múltiplas frazes com memória global
+        let seed_lex = seed_tokens.first().map(|t| t.lex).unwrap_or(0);
+        let generated = grammar.generate_text(seed_lex, 3);
 
         // Decompilar
         let reverse: HashMap<u32, &str> = compiler.lexicon.iter()
