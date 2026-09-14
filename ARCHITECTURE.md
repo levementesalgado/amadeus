@@ -1,4 +1,4 @@
-# Arquitetura do AMADEUS (v6.1 — Coesão Semântica)
+# Arquitetura do AMADEUS (v6.2 — SVD + Recurrent SNN + 3-Factor STDP)
 
 > *"Não é uma LLM. É uma pilha de lógica, filosofia e matemática que simula uma presença."*
 
@@ -12,12 +12,12 @@
 4. [CUBO Hierárquico — 4 Níveis](#4-cubo-hierárquico--4-níveis)
 5. [T2 — Concordância (Multi-hop)](#5-t2--concordância-multi-hop)
 6. [T3 — Seleção Lexical (Cascata 5 níveis)](#6-t3--seleção-lexical-cascata-5-níveis)
-7. [GRAPH Modulation (Morfológico + PPMI)](#7-graph-modulation-morfológico--ppmi)
+7. [GRAPH Modulation (SVD + Morfológico)](#7-graph-modulation-svd--morfológico)
 8. [Topic Tracking (Coesão Semântica)](#8-topic-tracking-coesão-semântica)
-9. [SNN — Rede Neural Spiking](#9-snn--rede-neural-spiking)
-10. [Treino](#10-treino)
+9. [SNN — Rede Neural Spiking Recorrente](#9-snn--rede-neural-spiking-recorrente)
+10. [3-Factor STDP (Friction como Sinal)](#10-3-factor-stdp-friction-como-sinal)
 11. [Geração Top-Down](#11-geração-top-down)
-12. [Estado Atual (v6.1)](#12-estado-atual-v61)
+12. [Estado Atual (v6.2)](#12-estado-atual-v62)
 13. [Filosofia da Stack](#13-filosofia-da-stack)
 
 ---
@@ -103,19 +103,30 @@ Palavras com mesma raiz compartilham bits → similaridade morfológica.
 
 ### Estilo (style)
 
-Cada palavra recebe `style` determinístico via hash do ID:
+Cada palavra recebe `style` via classificação morfológica (`classify_style()`):
+
+| Estilo | Valor | Critérios |
+|--------|-------|-----------|
+| Neutro | 0 | Maioria das palavras |
+| Formal | 1 | Sufixos técnicos (-logia, -ismo, -idade, -ário, -ância), palavras >12 chars, termos jurídicos/médicos |
+| Informal | 2 | Abreviações (vc, tb, msg), diminutivos (-inho/-ita), gírias (mano, cara, massa) |
+
+**Impacto**: Campo style antes era sempre 0 (hash). Agora popula registro por lexema → T3: 1055→1350 (+28%).
+
+### GRAPH Embedding (SVD)
+
+Embeddings semânticos via **fatoração SVD** sobre matriz de co-ocorrência PPMI:
+
 ```
-style = (id * 2654435761) % 3
+1. Coletar co-ocorrência (janela=5, ~510K tokens)
+2. Calcular PPMI (Pointwise Mutual Information)
+3. SVD via power iteration (32 dimensões, 5 iterações)
+4. Gram-Schmidt orthogonalization
+5. Quantizar: cada bit = sinal do componente (32-bit)
+6. XOR com embedding morfológico (prefix+root+suffix)
 ```
-- 0 = neutro
-- 1 = formal
-- 2 = informal
 
-Pontuação sempre style=0. O style é propagado para o Token7 via `with_style()`.
-
-### GRAPH Embedding
-
-Random indexing: cada lexema ganha um u32 aleatório. Durante `build_graph(tokens, window=3)`, para cada par de tokens na janela, o embedding de um é XOR com o embedding do outro rotacionado pela distância. Resultado: tokens que co-ocorrem têm assinaturas similares (poucos bits de diferença).
+**Top-2000 palavras** mais frequentes recebem embeddings SVD. Palavras fora do top-2000 usam apenas embedding morfológico.
 
 ---
 
@@ -458,9 +469,9 @@ generate(seed, max_len):
 
 ---
 
-## 11. SNN — Rede Neural Spiking (Classificador POS)
+## 11. SNN — Rede Neural Spiking Recorrente
 
-Documento completo em `ARCHITECTURE_SNN.md`. Resumo:
+### Arquitetura
 
 ```
 Input Layer (30 neurônios)
@@ -470,23 +481,51 @@ Hidden Layer (263 neurônios)
 Output Layer (7 neurônios = classes POS)
   ↓ 1 por classe: SUBST(0), VERBO(1), ADJ(2), ART(3), ADV(4), PREP/CONJ(5), PONT(6)
 16 timesteps LIF (tau=5.0, threshold=1.0, refrac=2)
-STDP: 10 épocas, lr=0.001, Top-1=82.8%, Top-3=86.0%
 ```
 
-- **Treinamento**: pesos extraídos das tabelas T3 + STDP iterativo (1055 exemplos)
-- **Inferência**: 16 iterações de simulação temporal → 7 probabilidades de classe
-- **Uso**: SNN prediz classe POS → T3 refina dentro dela → GRAPH desempata
-- **GGUF**: `snn.synapses_ih`, `snn.synapses_ho`, `snn.output_labels`
+### Recorrência (v6.2)
 
-### Arquitetura re-escrita (v6)
+**Problema**: SNN antigo rodava do zero a cada token (16 timesteps, sem memória entre chamadas).
 
-| Métrica | Antes (v5) | Agora (v6) |
-|---------|-----------|------------|
-| Output neurons | N (50K+ vocab) | **7** (classes POS) |
-| STDP Top-1 | 0.0% | **82.8%** |
-| STDP Top-3 | 0.0% | **86.0%** |
-| Exemplos treino | 57.445 | **1.055** |
-| Velocidade treino | 15min+ (timeout) | **~30s** |
+**Solução**: `infer_snn_recurrent()` — mantém potencial de membrana entre tokens.
+
+```rust
+// Antigo: reset a cada token
+net.reset();
+for t in 0..net.tsteps { ... }
+
+// Novo: membrana persiste
+// NÃO chama reset() — potencial carrega resíduo
+for t in 0..net.tsteps { ... }
+```
+
+**Impacto**: Dependência de longo alcance sem aumentar output neurons. Memória implícita no potencial de membrana.
+
+### 3-Factor STDP (v6.2)
+
+**Problema**: STDP original era cego — aprendia igual independente da qualidade da predição.
+
+**Solução**: `stdp_train_3factor(input, target, lr, modulator)`:
+
+```
+Δw = f(pre, post) × modulator
+
+modulator = 1.0 se predição correta (reforço)
+modulator = 0.3 se predição errada (fricção)
+```
+
+- **LTP** (potenciação): escalado pelo modulador → mais reforço quando acerta
+- **LTD** (depressão): reduzido quando modulador alto → menos esquecimento quando confiante
+
+### Métricas
+
+| Métrica | v5 | v6.0 | v6.2 |
+|---------|-----|------|------|
+| Output neurons | 50K+ | 7 | 7 |
+| STDP Top-1 | 0.0% | 82.0% | **89.2%** |
+| STDP Top-3 | 0.0% | 85.6% | **91.2%** |
+| Recorrência | Não | Não | **Sim** |
+| STDP rule | 2-fator | 2-fator | **3-fator** |
 
 ---
 
@@ -560,18 +599,20 @@ Documento completo em `ARCHITECTURE_HYBRID.md`. Resumo:
 
 ---
 
-## 13. Estado Atual (v6.1)
+## 13. Estado Atual (v6.2)
 
 ### Métricas
 
 | Componente | Métrica | Valor |
 |------------|---------|-------|
-| GRAPH | Embeddings | 50.030 |
+| GRAPH | Embeddings | 2.000 (SVD) |
 | GRAPH | Decomposição morfológica | 69.7% |
-| T3 | Entradas | 1.055 |
-| T2 | Padrões | 3.903 |
-| SNN | Top-1 | 82.0% |
-| SNN | Top-3 | 85.6% |
+| T3 | Entradas | 1.350 |
+| T2 | Padrões | 4.800 |
+| SNN | Top-1 | 89.2% |
+| SNN | Top-3 | 91.2% |
+| SNN | Recorrência | Sim |
+| SNN | STDP | 3-fator |
 | Corpus | Tokens | 510.291 |
 | Afixos | Componentes | 613 |
 | Topic | Momentum | 0.8 |
@@ -580,15 +621,20 @@ Documento completo em `ARCHITECTURE_HYBRID.md`. Resumo:
 ### Commits Recentes
 
 ```
-68dfd8d — topic tracking + cohesive sampling
-5b58bac — morphological vocabulary (174 components)
-b5cd30b — expanded vocabulary (613 components)
+1844b15 — 3-factor STDP (friction as reinforcement signal)
+75c412c — recurrent SNN (membrane persists between tokens)
+94d1b53 — GRAPH via SVD power iteration
+34b0dd0 — populate style field (28% T3 increase)
+9f3b02e — comprehensive documentation v6.1
 7aa1059 — suffix bonus in generation
+b5cd30b — expanded vocabulary (613 components)
+5b58bac — morphological vocabulary
+68dfd8d — topic tracking + cohesive sampling
 ```
 
 ### Documentação
 
-- `ARCHITECTURE.md` — Este arquivo
+- `ARCHITECTURE.md` — Este arquivo (v6.2)
 - `AMADEUS.md` — Visão geral
 - `ARCHITECTURE_SNN.md` — Rede Neural Spiking
 - `COESAO_SEMANTICA.md` — Coesão semântica + vocabulário morfológico

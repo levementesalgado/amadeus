@@ -1,24 +1,25 @@
-# AMADEUS SNN — Rede Neural Spiking para Classificação POS
+# AMADEUS SNN — Rede Neural Spiking Recorrente para Classificação POS
 
-> Classificador bio-inspirado de 7 classes POS. Usa STDP para aprender, modula o grammar na geração.
+> Classificador bio-inspirado de 7 classes POS. Usa STDP de 3 fatores com friction, memória recorrente entre tokens.
 
 ---
 
 ## Sumário
 
-1. [Arquitetura (v6)](#1-arquitetura-v6)
+1. [Arquitetura (v6.2)](#1-arquitetura-v62)
 2. [Encoding Morfológico](#2-encoding-morfológico)
 3. [Dinâmica Temporal (LIF)](#3-dinâmica-temporal-lif)
-4. [Treinamento STDP](#4-treinamento-stdp)
-5. [Pipeline de Geração](#5-pipeline-de-geração)
-6. [GGUF Serialization](#6-gguf-serialization)
-7. [Métricas](#7-métricas)
+4. [Recorrência (Membrana Persistente)](#4-recorrência-membrana-persistente)
+5. [Treinamento 3-Factor STDP](#5-treinamento-3-factor-stdp)
+6. [Pipeline de Geração](#6-pipeline-de-geração)
+7. [GGUF Serialization](#7-gguf-serialization)
+8. [Métricas](#8-métricas)
 
 ---
 
-## 1. Arquitetura (v6)
+## 1. Arquitetura (v6.2)
 
-### Re-escrita: 7 outputs (classes POS)
+### Recorrência + 3-Factor STDP
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -36,6 +37,10 @@
 │                          │                    │
 │                          │ 7× classe          │
 │                          │ + 256× T3 keys     │
+│                          │                    │
+│                          │ ★ MEMBRANA         │
+│                          │   PERSISTE         │
+│                          │   ENTRE TOKENS     │
 │                          └─────────┬─────────┘
 │                                    │
 │                          ┌─────────▼─────────┐
@@ -49,22 +54,22 @@
 │                          └───────────────────┘
 │                                    │
 │                          16 timesteps LIF
-│                          STDP lr=0.001
-│                          Top-1: 82.8%
-│                          Top-3: 86.0%
+│                          3-Factor STDP
+│                          Top-1: 89.2%
+│                          Top-3: 91.2%
 └─────────────────────────────────────────────────────────┘
 ```
 
 ### Antes vs Agora
 
-| Métrica | v5 (50K outputs) | v6 (7 outputs) |
-|---------|------------------|----------------|
-| Output neurons | 50.042 (1/lexema) | **7** (1/classe) |
-| STDP Top-1 | 0.0% | **82.8%** |
-| STDP Top-3 | 0.0% | **86.0%** |
-| Exemplos treino | 57.445 | **1.055** |
-| Velocidade | 15min+ (timeout) | **~30s** |
-| Aprendizagem | Não converge | **Converge** |
+| Métrica | v5 (50K outputs) | v6.0 (7 outputs) | v6.2 (recorrente) |
+|---------|------------------|------------------|-------------------|
+| Output neurons | 50.042 | **7** | **7** |
+| STDP Top-1 | 0.0% | 82.0% | **89.2%** |
+| STDP Top-3 | 0.0% | 85.6% | **91.2%** |
+| Recorrência | Não | Não | **Sim** |
+| STDP rule | 2-fator | 2-fator | **3-fator** |
+| Memória entre tokens | Não | Não | **Sim** |
 
 ---
 
@@ -100,7 +105,62 @@ se v ≥ threshold: spike, v=0, refrac=2
 
 ---
 
-## 4. Treinamento STDP
+## 4. Recorrência (Membrana Persistente)
+
+### Problema
+
+SNN antigo rodava do zero a cada token:
+```rust
+// Antigo
+net.reset();  // ← perde toda memória
+for t in 0..16 { ... }
+```
+
+### Solução
+
+Manter potencial de membrana entre tokens:
+```rust
+// Novo
+// NÃO chama reset() — membrana carrega resíduo
+for t in 0..16 { ... }
+```
+
+### Impacto
+
+- **Memória de longo alcance**: potencial acumulado entre tokens
+- **Sem overhead**: não aumenta neurons nem dimensões
+- **Biológico**: neurônios reais não reseta entre estímulos
+
+---
+
+## 5. Treinamento 3-Factor STDP
+
+### STDP clássico (2 fatores)
+
+```
+Δw = f(pre, post)
+```
+
+Apenas timing de spikes. Não sabe se a predição estava certa.
+
+### 3-Factor STDP (com modulador)
+
+```
+Δw = f(pre, post) × modulator
+```
+
+**Modulador** = sinal de fricção/reforço:
+- `modulator = 1.0` → predição correta (reforço)
+- `modulator = 0.3` → predição errada (fricção)
+
+### Efeito
+
+| Condição | LTP (potenciação) | LTD (depressão) |
+|----------|-------------------|-----------------|
+| Acertou (mod=1.0) | Forte (1.0×) | Fraca (0.15×) |
+| Errou (mod=0.3) | Fraca (0.3×) | Moderada (0.85×) |
+
+**Resultado**: rede aprende mais rápido com exemplos que acerta, esquece menos quando confiante.
 
 ### Pesos iniciais (extraídos do grammar)
 
@@ -121,18 +181,22 @@ Pesos H→O:
   T3 neurons → classe do morph (0.5)
 ```
 
-### STDP iterativo
+### STDP iterativo com 3 fatores
 
 ```rust
 for epoch in 0..10 {
-    // Embaralhar 1.055 exemplos
     for (morph, syn_func, style, class_id) in examples {
         let trains = enc.encode(morph, syn_func, style, 16, rng);
         let output_spikes = self.run(&trains);
         
-        // Calcular top-1 e top-3
-        // STDP: atualizar pesos sinápticos
-        self.stdp_train(&trains, target_idx, 0.001);
+        // Predição
+        let predicted = scores.first().map(|(c, _)| *c).unwrap_or(0);
+        
+        // Modulador: 1.0 se acertou, 0.3 se errou
+        let modulator = if predicted == class_id { 1.0 } else { 0.3 };
+        
+        // STDP de 3 fatores
+        self.stdp_train_3factor(&trains, target_idx, 0.001, modulator);
     }
 }
 ```
@@ -140,28 +204,28 @@ for epoch in 0..10 {
 ### Resultados
 
 ```
-Época 1:  Top-1=77.8%  Top-3=83.8%
-Época 5:  Top-1=84.4%  Top-3=87.4%  ← pico
-Época 10: Top-1=82.8%  Top-3=86.0%  ← estável
+Época 1:  Top-1=84.0%  Top-3=89.8%
+Época 5:  Top-1=86.8%  Top-3=91.4%
+Época 10: Top-1=89.2%  Top-3=91.2%
 ```
 
 ---
 
-## 5. Pipeline de Geração
+## 6. Pipeline de Geração
 
 ```
 1. CUBO hierárquico → prediz classe POS (estrutura sintática)
 2. T3 lexicon → top-16 candidatos P(palavra | morph, syn_func, style)
-3. SNN 7-outputs → confirma classe (82.8%)
+3. SNN recorrente → confirma classe (89.2%) ★ memória entre tokens
 4. Se classe do SNN == classe do T3 → usa T3
 5. Se não → fallback para frequency-based
-6. GRAPH → modula CUBO via Hamming distance
+6. GRAPH (SVD) → modula CUBO via Hamming distance
 ```
 
 ### Backoff
 
 ```
-CUBO → classe → T3 refina → SNN confirma → GRAPH desempata
+CUBO → classe → T3 refina → SNN recorrente confirma → GRAPH (SVD) desempata
 ```
 
 ---
@@ -203,21 +267,23 @@ CUBO → classe → T3 refina → SNN confirma → GRAPH desempata
 
 | Tabela | Entradas |
 |--------|----------|
-| T3 (exact) | 1.055 |
-| T2 (concordância) | 3.906 |
-| GRAPH (PPMI) | 50.030 |
+| T3 (exact) | 1.350 |
+| T2 (concordância) | 4.800 |
+| GRAPH (SVD) | 2.000 |
 | Bigramas | ~50K pares |
 
 ### STDP
 
-| Métrica | Valor |
-|---------|-------|
-| Top-1 accuracy | 82.8% |
-| Top-3 accuracy | 86.0% |
-| Learning rate | 0.001 |
-| Epochs | 10 |
-| Samples/epoch | 1.055 |
+| Métrica | v6.0 | v6.2 |
+|---------|------|------|
+| Top-1 accuracy | 82.0% | **89.2%** |
+| Top-3 accuracy | 85.6% | **91.2%** |
+| Learning rate | 0.001 | 0.001 |
+| STDP rule | 2-fator | **3-fator** |
+| Recorrência | Não | **Sim** |
+| Epochs | 10 | 10 |
+| Samples/epoch | 1.055 | 1.350 |
 
 ---
 
-*AMADEUS SNN v6 — Setembro 2026*
+*AMADEUS SNN v6.2 — Setembro 2026*
