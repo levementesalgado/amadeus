@@ -756,17 +756,31 @@ impl TripleGrammar {
 
             let cls = expected_class.unwrap_or(0);
 
-            // Usar sample_lex_full com candidate=0 (sem preferência)
-            let morph = (cls as u16) << 8;
-            let syn_func: u8 = 0;
-            let style: u16 = 0;
-
-            let lex = self.sample_lex_full(morph, syn_func, style, cls, 0);
+            let lex = if let Some(dist) = self.lexicon_class.get(&cls) {
+                let total = self.lexicon_class_totals.get(&cls).copied().unwrap_or(0.0);
+                if total > 0.0 {
+                    let mut r = self.rng.f32() * total;
+                    let mut chosen = 0u32;
+                    for (&id, &freq) in dist {
+                        r -= freq;
+                        if r <= 0.0 {
+                            chosen = id;
+                            break;
+                        }
+                    }
+                    if chosen == 0 { *dist.keys().next().unwrap_or(&0) } else { chosen }
+                } else {
+                    *dist.keys().next().unwrap_or(&0)
+                }
+            } else {
+                0
+            };
 
             if lex != 0 {
+                let morph = (cls as u16) << 8;
                 let token = Token7::new(lex, morph)
-                    .with_syn(0, syn_func)
-                    .with_style(style);
+                    .with_syn(0, 0)
+                    .with_style(0);
                 out.push(token);
             }
         }

@@ -557,22 +557,21 @@ fn main() {
         "a vida",
     ];
 
+    // Decompilar: lex_id → palavra (owned strings)
+    let reverse_owned: HashMap<u32, String> = compiler.lexicon.iter()
+        .map(|(w, &(id, _, _, _))| (id, w.clone()))
+        .collect();
+
     for seed in &seeds {
         let seed_tokens = compiler.compile(seed);
         if seed_tokens.is_empty() { continue; }
 
-        // Gerar texto: múltiplas frazes com memória global
         let seed_lex = seed_tokens.first().map(|t| t.lex).unwrap_or(0);
         let generated = grammar.generate_text(seed_lex, 3);
 
-        // Decompilar
-        let reverse: HashMap<u32, &str> = compiler.lexicon.iter()
-            .map(|(w, &(id, _, _, _))| (id, w.as_str()))
-            .collect();
-
         let words: Vec<&str> = generated.iter()
             .filter(|t| t.lex != 0)
-            .filter_map(|t| reverse.get(&t.lex).copied())
+            .filter_map(|t| reverse_owned.get(&t.lex).map(|s| s.as_str()))
             .collect();
 
         println!("  \"{}\" → {}", seed, words.join(" "));
@@ -589,16 +588,27 @@ fn main() {
         if seed_tokens.is_empty() { continue; }
         let generated = grammar.generate_with_snn(&seed_tokens, 20);
 
-        let reverse: HashMap<u32, &str> = compiler.lexicon.iter()
-            .map(|(w, &(id, _, _, _))| (id, w.as_str()))
+        let words: Vec<&str> = generated.iter()
+            .filter(|t| t.lex != 0)
+            .filter_map(|t| reverse_owned.get(&t.lex).map(|s| s.as_str()))
             .collect();
+        println!("  \"{}\" (SNN) → {}", seed, words.join(" "));
+    }
+
+    // Testar geração retórica
+    println!();
+    println!("  Geração retórica (planejamento):");
+    for seed in &seeds[..3] {
+        let seed_tokens = compiler.compile(seed);
+        if seed_tokens.is_empty() { continue; }
+        let seed_lex = seed_tokens.first().map(|t| t.lex).unwrap_or(0);
+        let generated = grammar.generate_text_rhetorical(seed_lex, 3);
 
         let words: Vec<&str> = generated.iter()
             .filter(|t| t.lex != 0)
-            .filter_map(|t| reverse.get(&t.lex).copied())
+            .filter_map(|t| reverse_owned.get(&t.lex).map(|s| s.as_str()))
             .collect();
-
-        println!("  \"{}\" (SNN) → {}", seed, words.join(" "));
+        println!("  \"{}\" (retórico) → {}", seed, words.join(" "));
     }
 
     println!();
