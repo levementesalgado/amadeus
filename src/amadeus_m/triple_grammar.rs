@@ -462,10 +462,34 @@ impl TripleGrammar {
 
         // 2. Para cada candidato, calcular score combinado:
         //    score = α * coesão + (1-α) * frequência
+        //    coesão = similaridade com tópico + bônus para mesmo sufixo
         let alpha = self.cohesion_alpha as f64;
         let scored: Vec<(u32, f64)> = candidates.iter()
             .map(|&(id, freq)| {
-                let cohesion = self.cohesion_score(id) as f64;
+                // Coesão base (Hamming distance)
+                let base_cohesion = self.cohesion_score(id) as f64;
+
+                // Bônus: se o candidato tem o mesmo sufixo que a última palavra
+                let suffix_bonus = if let Some(last) = self.recent_graphs.last() {
+                    if *last != 0 {
+                        let last_graph = *last;
+                        let cand_graph = self.graph.get(&id).copied().unwrap_or(0);
+                        // Se os bits do sufixo estão presentes (aproximação)
+                        let suffix_bits = cand_graph & 0x00FF0000; // bits 16-23 = sufixo
+                        let last_suffix_bits = last_graph & 0x00FF0000;
+                        if suffix_bits == last_suffix_bits && suffix_bits != 0 {
+                            0.2 // bônus de 20%
+                        } else {
+                            0.0
+                        }
+                    } else {
+                        0.0
+                    }
+                } else {
+                    0.0
+                };
+
+                let cohesion = (base_cohesion + suffix_bonus).min(1.0);
                 let freq_score = (freq as f64).powf(1.0 / temp as f64);
                 let combined = alpha * cohesion + (1.0 - alpha) * freq_score;
                 (id, combined)
