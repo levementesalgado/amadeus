@@ -1,4 +1,4 @@
-# Arquitetura do AMADEUS (v4 — CUBO Hierárquico)
+# Arquitetura do AMADEUS (v6.1 — Coesão Semântica)
 
 > *"Não é uma LLM. É uma pilha de lógica, filosofia e matemática que simula uma presença."*
 
@@ -7,15 +7,18 @@
 ## Sumário
 
 1. [Token7 — A Representação Universal](#1-token7--a-representação-universal)
-2. [Compiler — Léxico + Estilo](#2-compiler--léxico--estilo)
-3. [CUBO Hierárquico — 4 Níveis](#3-cubo-hierárquico--4-níveis)
-4. [T2 — Concordância (Multi-hop)](#4-t2--concordância-multi-hop)
-5. [T3 — Seleção Lexical (Cascata 5 níveis)](#5-t3--seleção-lexical-cascata-5-níveis)
-6. [GRAPH Modulation](#6-graph-modulation)
-7. [Treino](#7-treino)
-8. [Geração Top-Down](#8-geração-top-down)
-9. [Estado Atual (v4)](#9-estado-atual-v4)
-10. [Filosofia da Stack](#10-filosofia-da-stack)
+2. [Vocabulário Morfológico](#2-vocabulário-morfológico)
+3. [Compiler — Léxico + Estilo](#3-compiler--léxico--estilo)
+4. [CUBO Hierárquico — 4 Níveis](#4-cubo-hierárquico--4-níveis)
+5. [T2 — Concordância (Multi-hop)](#5-t2--concordância-multi-hop)
+6. [T3 — Seleção Lexical (Cascata 5 níveis)](#6-t3--seleção-lexical-cascata-5-níveis)
+7. [GRAPH Modulation (Morfológico + PPMI)](#7-graph-modulation-morfológico--ppmi)
+8. [Topic Tracking (Coesão Semântica)](#8-topic-tracking-coesão-semântica)
+9. [SNN — Rede Neural Spiking](#9-snn--rede-neural-spiking)
+10. [Treino](#10-treino)
+11. [Geração Top-Down](#11-geração-top-down)
+12. [Estado Atual (v6.1)](#12-estado-atual-v61)
+13. [Filosofia da Stack](#13-filosofia-da-stack)
 
 ---
 
@@ -48,7 +51,42 @@ bits 8-10:  person (0=1, 1=2, 2=3)
 
 ---
 
-## 2. Compiler — Léxico + Estilo
+## 2. Vocabulário Morfológico
+
+### Componentes (613 total)
+
+| Tipo | Qtd | Exemplos |
+|------|-----|----------|
+| Prefixos | 82 | anti, auto, bi, co, com, con, contra, de, des, dis, en, ex, extra, hiper, im, in, inter, macro, micro, neo, pós, pré, pro, re, retro, semi, sub, super, trans, tri, uni, vice |
+| Sufixos | 128 | ção, dade, ismo, mente, oso, ível, ar, er, ir, ando, endo, indo, ado, ido, inho, ito, éta, ote,ão, ona, arra, able, ible, osa, oso, ento, mento, nal, ico, vel, íssimo |
+| Raízes | 403 | ser, estar, ter, fazer, dizer, ir, vir, dar, ver, saber, poder, querer, ficar, passar, achar, trazer, casa, vida, mundo, terra, homem, mulher, bom, mau, grande, pequeno |
+
+### Decomposição
+
+```
+invisível    = in + ível        (prefixo + sufixo)
+desconhecido = des + conhec + ido (prefixo + raiz + sufixo)
+correndo     = co + endo         (prefixo + sufixo)
+brasileiro   = + eiro            (sufixo)
+```
+
+### Embeddings Morfológicos
+
+Cada afixo → 32-bit hash:
+- Bits 0-5: comprimento (0-63)
+- Bits 6-13: primeira letra (a-z)
+- Bits 14-21: última letra
+- Bits 22-25: vogais
+- Bits 26-29: consoantes
+- XOR com FNV hash
+
+**Palavra = XOR(bits_prefixo, bits_raiz, bits_sufixo)**
+
+Palavras com mesma raiz compartilham bits → similaridade morfológica.
+
+---
+
+## 3. Compiler — Léxico + Estilo
 
 `compiler.rs` — O compilador transforma texto em `Vec<Token7>`.
 
@@ -218,7 +256,44 @@ Durante `sample_lex_modulated()`:
 
 ---
 
-## 7. Treino
+## 8. Topic Tracking (Coesão Semântica)
+
+### Campos
+
+```rust
+pub topic_graph: u32,        // vetor tópico atual
+pub topic_momentum: f32,     // inércia (0.8 = muda devagar)
+pub recent_graphs: Vec<u32>, // janela de 32 tokens
+pub cohesion_alpha: f32,     // peso coesão vs frequência (0.4)
+```
+
+### Algoritmo
+
+```
+1. Para cada token gerado:
+   - Adicionar GRAPH à janela recente
+   - Calcular média ponderada exponencial
+   - Misturar com tópico anterior (momentum)
+
+2. Momentum: topic_graph = 80% anterior + 20% novo
+   - Mantém consistência entre frazes
+   - Permite mudança gradual de tópico
+```
+
+### Amostragem Coesa
+
+```
+score = α × coesão + (1-α) × frequência
+
+coesão = base_hamming + suffix_bonus
+
+base_hamming = sigmoid(10 × (similaridade - 0.5))
+suffix_bonus = 0.2 se mesmo sufixo que última palavra
+```
+
+---
+
+## 9. T2 — Concordância (Multi-hop)
 
 ### Pipeline (`pedagogy.rs`)
 
@@ -485,7 +560,43 @@ Documento completo em `ARCHITECTURE_HYBRID.md`. Resumo:
 
 ---
 
-## 13. Filosofia da Stack
+## 13. Estado Atual (v6.1)
+
+### Métricas
+
+| Componente | Métrica | Valor |
+|------------|---------|-------|
+| GRAPH | Embeddings | 50.030 |
+| GRAPH | Decomposição morfológica | 69.7% |
+| T3 | Entradas | 1.055 |
+| T2 | Padrões | 3.903 |
+| SNN | Top-1 | 82.0% |
+| SNN | Top-3 | 85.6% |
+| Corpus | Tokens | 510.291 |
+| Afixos | Componentes | 613 |
+| Topic | Momentum | 0.8 |
+| Topic | Alpha | 0.4 |
+
+### Commits Recentes
+
+```
+68dfd8d — topic tracking + cohesive sampling
+5b58bac — morphological vocabulary (174 components)
+b5cd30b — expanded vocabulary (613 components)
+7aa1059 — suffix bonus in generation
+```
+
+### Documentação
+
+- `ARCHITECTURE.md` — Este arquivo
+- `AMADEUS.md` — Visão geral
+- `ARCHITECTURE_SNN.md` — Rede Neural Spiking
+- `COESAO_SEMANTICA.md` — Coesão semântica + vocabulário morfológico
+- `benchmarks/PROGRESS.md` — Progresso do treinamento
+
+---
+
+## 14. Filosofia da Stack
 
 Documento completo em `PHILOSOPHICAL_STACK.md`. Resumo das 5 camadas:
 
@@ -512,7 +623,8 @@ Fundação Matemática (Hardware)
 | Teorias da Decisão | `pedagogy.rs`, `teacher.rs` |
 | Filosofia da Mente | `consciousness.rs`, `affect.rs` |
 | **Hierarquia** | `hierarchical.rs` — nova camada entre Hardware e Lógica |
+| **Morfologia** | `morph_vocab.rs` — vocabulário de afixos portugueses |
 
 ---
 
-*AMADEUS v4 — Junho 2026*
+*AMADEUS v6.1 — Setembro 2026*
