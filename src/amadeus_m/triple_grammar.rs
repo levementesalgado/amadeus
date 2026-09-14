@@ -46,6 +46,11 @@ pub struct TripleGrammar {
     pub context_bigrams: HashMap<(u32, u32), HashMap<u32, f32>>,
     pub context_totals: HashMap<(u32, u32), f32>,
     pub unigrams: HashMap<u32, f32>,
+    // Coesão semântica: topic tracking
+    pub topic_graph: u32,
+    pub topic_momentum: f32,
+    pub recent_graphs: Vec<u32>,
+    pub cohesion_alpha: f32,
 }
 
 impl TripleGrammar {
@@ -81,6 +86,10 @@ impl TripleGrammar {
             context_bigrams: HashMap::new(),
             context_totals: HashMap::new(),
             unigrams: HashMap::new(),
+            topic_graph: 0,
+            topic_momentum: 0.8,
+            recent_graphs: Vec::new(),
+            cohesion_alpha: 0.4,
         }
     }
 
@@ -346,6 +355,140 @@ impl TripleGrammar {
         scores.last().map(|&(id, _)| id).unwrap_or(0)
     }
 
+    // ─── Coesão semântica: topic tracking ───
+
+    /// Atualiza o tópico atual baseado nos tokens recentes
+    /// Usa média ponderada exponencial (mais peso para tokens recentes)
+    pub fn update_topic(&mut self, new_graph: u32) {
+        if new_graph == 0 { return; }
+
+        self.recent_graphs.push(new_graph);
+        // Manter janela de 32 tokens
+        if self.recent_graphs.len() > 32 {
+            self.recent_graphs.remove(0);
+        }
+
+        // Calcular média ponderada exponencial
+        // Tokens recentes têm peso maior
+        let mut weighted_sum: u32 = 0;
+        let mut total_weight: f32 = 0.0;
+        let n = self.recent_graphs.len();
+
+        for (i, &g) in self.recent_graphs.iter().enumerate() {
+            // Peso exponencial: último token tem peso 1.0, primeiro tem peso ~0.1
+            let age = (n - i) as f32;
+            let weight = (-age * 0.1).exp();
+            // XOR ponderado não existe, então usamos XOR com pesos binários
+            if weight > 0.5 {
+                weighted_sum ^= g;
+            }
+            total_weight += weight;
+        }
+
+        // Misturar com tópico anterior (momentum)
+        let momentum = self.topic_momentum;
+        self.topic_graph = if self.topic_graph == 0 {
+            weighted_sum
+        } else {
+            // Mistura: momentum * tópico_anterior + (1-momentum) * novo
+            if total_weight > 0.0 && self.rng.f32() < (1.0 - momentum) {
+                weighted_sum
+            } else {
+                self.topic_graph
+            }
+        };
+    }
+
+    /// Calcula score de coesão semântica para um candidato
+    /// Retorna valor entre 0.0 (sem coesão) e 1.0 (perfeita coesão)
+    pub fn cohesion_score(&self, candidate_lex: u32) -> f32 {
+        if self.topic_graph == 0 || candidate_lex == 0 {
+            return 0.5; // neutro quando não há tópico
+        }
+
+        let candidate_graph = self.graph.get(&candidate_lex).copied().unwrap_or(0);
+        if candidate_graph == 0 {
+            return 0.3; // baixa coesão para palavras sem embedding
+        }
+
+        // Hamming distance normalizado
+        let dist = Self::hamming(self.topic_graph, candidate_graph) as f32;
+        let max_dist = 32.0;
+
+        // Similaridade: 1.0 (idêntico) a 0.0 (completamente diferente)
+        let similarity = 1.0 - (dist / max_dist);
+
+        // Aplicar sigmoid para comprimir
+        let sigmoid = 1.0 / (1.0 + (-10.0 * (similarity - 0.5)).exp());
+        sigmoid
+    }
+
+    /// Amostragem com coesão: combina T3 (morfologia) + GRAPH (semântica)
+    /// Retorna o lex_id mais coerente
+    pub fn sample_cohesive(
+        &mut self,
+        morph: u16,
+        syn_func: u8,
+        style: u16,
+        cls: u8,
+        temperature: f32,
+    ) -> u32 {
+        let temp = temperature.max(0.01);
+
+        // 1. Buscar candidatos do T3 (morfologicamente corretos)
+        let candidates: Vec<(u32, f32)> = {
+            let key_exact = (morph, syn_func, style);
+            let key_css = (cls, syn_func, style);
+            let key_cs = (cls, syn_func);
+
+            self.lexicon.get(&key_exact)
+                .or(self.lexicon_cls_syn_style.get(&key_css))
+                .or(self.lexicon_cls_syn.get(&key_cs))
+                .or(self.lexicon_class.get(&cls))
+                .map(|m| {
+                    let total: f32 = m.values().sum();
+                    if total > 0.0 {
+                        m.iter().map(|(&id, &count)| (id, count / total)).collect()
+                    } else {
+                        Vec::new()
+                    }
+                })
+                .unwrap_or_default()
+        };
+
+        if candidates.is_empty() {
+            return 0;
+        }
+
+        // 2. Para cada candidato, calcular score combinado:
+        //    score = α * coesão + (1-α) * frequência
+        let alpha = self.cohesion_alpha as f64;
+        let scored: Vec<(u32, f64)> = candidates.iter()
+            .map(|&(id, freq)| {
+                let cohesion = self.cohesion_score(id) as f64;
+                let freq_score = (freq as f64).powf(1.0 / temp as f64);
+                let combined = alpha * cohesion + (1.0 - alpha) * freq_score;
+                (id, combined)
+            })
+            .collect();
+
+        // 3. Amostrar da distribuição combinada
+        let sum: f64 = scored.iter().map(|(_, s)| s).sum();
+        if sum <= 0.0 {
+            return candidates[0].0;
+        }
+
+        let mut r = self.rng.f64() * sum;
+        for &(id, score) in &scored {
+            r -= score;
+            if r <= 0.0 {
+                return id;
+            }
+        }
+
+        scored.last().map(|&(id, _)| id).unwrap_or(candidates[0].0)
+    }
+
     // ─── Backoff estruturado: CUBO → classe → T3 refina ───
 
     /// Geração com backoff estruturado:
@@ -387,7 +530,7 @@ impl TripleGrammar {
     // ─── Geração incremental com memória global ───
 
     /// Gera texto pedaço por pedaço, mantendo memória global
-    /// RetornaIterator de tokens gerados
+    /// Retorna Vec de tokens gerados
     pub fn generate_incremental(
         &mut self,
         seed: &[Token7],
@@ -395,19 +538,17 @@ impl TripleGrammar {
         chunk_size: usize,
     ) -> Vec<Token7> {
         let mut out = seed.to_vec();
-        let mut global_graph: Vec<u32> = Vec::new(); // memória global de GRAPHs
 
-        // Seed: coletar GRAPHs do seed
+        // Seed: inicializar tópico com GRAPHs do seed
         for t in seed {
             if let Some(&g) = self.graph.get(&t.lex) {
-                global_graph.push(g);
+                self.update_topic(g);
             }
         }
 
         let mut generated = 0;
         while generated < total_tokens {
             // Gerar chunk de tamanho chunk_size
-            let chunk_start = out.len();
             for _ in 0..chunk_size {
                 let syn_history = if out.len() >= 2 {
                     assign_dependencies(&out)
@@ -416,68 +557,39 @@ impl TripleGrammar {
                 };
                 let clause_depths = Self::compute_clause_depths(&syn_history);
 
-                // Backoff estruturado
-                let (cubo_lex, class) = self.sample_structured(&syn_history, &clause_depths);
+                // 1. CUBO prediz classe
+                let cubo_lex = if self.graph_alpha > 0.0 && !self.graph.is_empty() {
+                    self.hier.clause.sample_lex_modulated(&syn_history, &clause_depths, self.temperature.max(0.01), self.exploration_rate, &mut self.rng, Some(&self.graph), self.graph_alpha)
+                } else {
+                    self.hier.clause.sample_lex(&syn_history, &clause_depths, self.temperature.max(0.01), self.exploration_rate, &mut self.rng)
+                };
                 if cubo_lex == 0 { break; }
 
-                // Refinar com T3
+                let predicted_class = self.lex_to_class.get(&cubo_lex).copied().unwrap_or(0);
+
+                // 2. Refinar morph/style
                 let refined = self.refine_token(&out, cubo_lex);
 
-                // SNN confirma classe
-                let snn_class = if self.snn.is_some() {
-                    self.snn_sample(refined.morph, refined.syn_func, refined.style, refined.lex)
-                } else {
-                    refined.morph as u32
-                };
-
-                // Amostrar com contexto + GRAPH global
-                let (prev2, prev1) = if out.len() >= 2 {
-                    (out[out.len() - 2].lex, out[out.len() - 1].lex)
-                } else if out.len() == 1 {
-                    (0, out[out.len() - 1].lex)
-                } else {
-                    (0, 0)
-                };
-
-                let ctx_lex = self.sample_lex_with_context(
+                // 3. Amostragem coesa
+                let final_lex = self.sample_cohesive(
                     refined.morph, refined.syn_func, refined.style,
-                    refined.morph_class(), refined.lex, prev2, prev1, 0.7,
+                    predicted_class, self.temperature,
                 );
 
-                // Se ctx_lex não bate com classe predita, usar CUBO
-                let ctx_class = self.lex_to_class.get(&ctx_lex).copied().unwrap_or(0);
-                let final_lex = if ctx_class == class || class == 0 {
-                    ctx_lex
-                } else {
-                    cubo_lex
-                };
+                let final_lex = if final_lex == 0 { cubo_lex } else { final_lex };
 
                 let final_token = Token7::new(final_lex, refined.morph)
                     .with_syn(refined.syn_off, refined.syn_func)
                     .with_style(refined.style);
                 out.push(final_token);
 
-                // Atualizar memória global
+                // 4. Atualizar tópico
                 if let Some(&g) = self.graph.get(&final_lex) {
-                    global_graph.push(g);
-                    // Manter memória limitada (últimas 64 palavras)
-                    if global_graph.len() > 64 {
-                        global_graph.remove(0);
-                    }
+                    self.update_topic(g);
                 }
 
                 generated += 1;
                 if final_lex == 0 { break; }
-            }
-
-            // A cada chunk, "reciclar" memória global
-            // O GRAPH médio do chunk influencia próximo chunk
-            if global_graph.len() > chunk_size {
-                // Pesar GRAPHs recentes mais (recência)
-                let recent_start = global_graph.len().saturating_sub(chunk_size);
-                let _recent_avg: u32 = global_graph[recent_start..].iter()
-                    .fold(0u32, |acc, &g| acc ^ g);
-                // TODO: usar _recent_avg para modular próximo chunk
             }
         }
 
@@ -487,7 +599,7 @@ impl TripleGrammar {
     // ─── Geração por frazes (frase como unidade) ───
 
     /// Gera uma frase completa: CUBO prediz sequência de classes,
-    /// depois enche cada posição com lexema adequado
+    /// depois enche cada posição com lexema coerente
     pub fn generate_phrase(&mut self, _seed_graph: u32, max_len: usize) -> Vec<Token7> {
         let mut out: Vec<Token7> = Vec::new();
 
@@ -509,56 +621,26 @@ impl TripleGrammar {
 
             let predicted_class = self.lex_to_class.get(&cubo_lex).copied().unwrap_or(0);
 
-            // 2. Usar T3 lexicon: P(palavra | morph, syn_func, style)
-            //    O cubo_lex já veio do CUBO com morph/syn/style corretos
-            //    Agora refinar: pegar top candidatos do T3 e amostrar
+            // 2. Refinar morph/style via T2 multi-hop
             let refined = self.refine_token(&out, cubo_lex);
 
-            // 3. Buscar alternativas no mesmo T3 key (mesma morfologia/função)
-            let t3key = (refined.morph, refined.syn_func, refined.style);
-            let final_lex = if let Some(candidates) = self.lexicon.get(&t3key) {
-                let mut freq: Vec<(u32, f32)> = candidates.iter()
-                    .map(|(&id, &count)| (id, count))
-                    .collect();
-                freq.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            // 3. Amostragem coesa: T3 (morfologia) + GRAPH (semântica)
+            let final_lex = self.sample_cohesive(
+                refined.morph, refined.syn_func, refined.style,
+                predicted_class, temp,
+            );
 
-                // Amostrar com temperatura entre top-K
-                let top: Vec<(u32, f64)> = freq.iter().take(16)
-                    .map(|&(id, count)| {
-                        let w = (count as f64).powf(1.0 / temp as f64);
-                        (id, w)
-                    })
-                    .collect();
-
-                let sum: f64 = top.iter().map(|(_, w)| w).sum();
-                if sum > 0.0 {
-                    let mut r = self.rng.f64() * sum;
-                    let mut chosen = cubo_lex;
-                    for &(id, w) in &top {
-                        r -= w;
-                        if r <= 0.0 { chosen = id; break; }
-                    }
-                    chosen
-                } else {
-                    cubo_lex
-                }
-            } else {
-                // Fallback: lexicon_class (frequência da classe)
-                if let Some(class_words) = self.lexicon_class.get(&predicted_class) {
-                    let mut freq: Vec<(u32, f32)> = class_words.iter()
-                        .map(|(&id, &count)| (id, count))
-                        .collect();
-                    freq.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-                    freq.first().map(|&(id, _)| id).unwrap_or(cubo_lex)
-                } else {
-                    cubo_lex
-                }
-            };
+            let final_lex = if final_lex == 0 { cubo_lex } else { final_lex };
 
             let final_token = Token7::new(final_lex, refined.morph)
                 .with_syn(refined.syn_off, refined.syn_func)
                 .with_style(refined.style);
             out.push(final_token);
+
+            // 4. Atualizar tópico com o GRAPH do token gerado
+            if let Some(&g) = self.graph.get(&final_lex) {
+                self.update_topic(g);
+            }
 
             if predicted_class == 6 { break; }
         }
@@ -570,16 +652,20 @@ impl TripleGrammar {
     /// Cada frase usa o GRAPH final da frase anterior como contexto
     pub fn generate_text(&mut self, seed_lex: u32, n_sentences: usize) -> Vec<Token7> {
         let mut all_tokens: Vec<Token7> = Vec::new();
-        let mut global_graph = self.graph.get(&seed_lex).copied().unwrap_or(0);
+
+        // Inicializar tópico com seed
+        if let Some(&g) = self.graph.get(&seed_lex) {
+            self.update_topic(g);
+        }
 
         for sent_i in 0..n_sentences {
-            // Gerar frase usando GRAPH global como contexto
-            let phrase = self.generate_phrase(global_graph, 15);
+            // Gerar frase usando tópico atual como contexto
+            let phrase = self.generate_phrase(self.topic_graph, 15);
 
-            // Atualizar memória global: XOR dos GRAPHs da frase
+            // Atualizar tópico com tokens da frase
             for t in &phrase {
                 if let Some(&g) = self.graph.get(&t.lex) {
-                    global_graph ^= g;
+                    self.update_topic(g);
                 }
             }
 
@@ -919,7 +1005,7 @@ impl TripleGrammar {
         out
     }
 
-    /// Geração usando SNN + bigramas para coesão
+    /// Geração usando SNN + coesão semântica
     pub fn generate_with_snn(&mut self, seed: &[Token7], max_len: usize) -> Vec<Token7> {
         if self.snn.is_none() {
             return self.generate(seed, max_len);
@@ -927,17 +1013,23 @@ impl TripleGrammar {
 
         let mut out = seed.to_vec();
 
+        // Inicializar tópico
+        for t in seed {
+            if let Some(&g) = self.graph.get(&t.lex) {
+                self.update_topic(g);
+            }
+        }
+
         for _ in 0..max_len {
             let syn_history = if out.len() >= 2 { assign_dependencies(&out) } else { out.clone() };
             let clause_depths = Self::compute_clause_depths(&syn_history);
             let temp = self.temperature.max(0.01);
-            let explore = self.rng.f32();
 
             // 1. CUBO prediz lex_id
             let cubo_lex = if self.graph_alpha > 0.0 && !self.graph.is_empty() {
-                self.hier.clause.sample_lex_modulated(&syn_history, &clause_depths, temp, explore, &mut self.rng, Some(&self.graph), self.graph_alpha)
+                self.hier.clause.sample_lex_modulated(&syn_history, &clause_depths, temp, self.exploration_rate, &mut self.rng, Some(&self.graph), self.graph_alpha)
             } else {
-                self.hier.clause.sample_lex(&syn_history, &clause_depths, temp, explore, &mut self.rng)
+                self.hier.clause.sample_lex(&syn_history, &clause_depths, temp, self.exploration_rate, &mut self.rng)
             };
 
             if cubo_lex == 0 { break; }
@@ -948,24 +1040,15 @@ impl TripleGrammar {
             // 3. SNN prediz classe POS
             let snn_class = self.snn_sample(refined.morph, refined.syn_func, refined.style, cubo_lex) as u8;
 
-            // 4. Usar bigramas + SNN class para amostrar lexema final
-            let (prev2, prev1) = if out.len() >= 2 {
-                (out[out.len() - 2].lex, out[out.len() - 1].lex)
-            } else if out.len() == 1 {
-                (0, out[out.len() - 1].lex)
-            } else {
-                (0, 0)
-            };
-
-            let ctx_lex = self.sample_lex_with_context(
+            // 4. Amostragem coesa (T3 + GRAPH)
+            let cohesive_lex = self.sample_cohesive(
                 refined.morph, refined.syn_func, refined.style,
-                refined.morph_class(), cubo_lex, prev2, prev1, 0.8,
+                snn_class, temp,
             );
 
-            // 5. SNN modula: se classe do SNN bate com classe do ctx_lex, usar ctx_lex
-            let ctx_class = self.lex_to_class.get(&ctx_lex).copied().unwrap_or(0);
-            let final_lex = if ctx_class == snn_class || snn_class == 0 {
-                ctx_lex
+            // 5. Se SNN confirma classe, usar coesa; senão, fallback
+            let final_lex = if cohesive_lex != 0 {
+                cohesive_lex
             } else {
                 // Fallback: grammar morfológica
                 self.sample_lex_full(refined.morph, refined.syn_func, refined.style, refined.morph_class(), cubo_lex)
@@ -975,6 +1058,11 @@ impl TripleGrammar {
                 .with_syn(refined.syn_off, refined.syn_func)
                 .with_style(refined.style);
             out.push(final_token);
+
+            // 6. Atualizar tópico
+            if let Some(&g) = self.graph.get(&final_lex) {
+                self.update_topic(g);
+            }
         }
 
         out

@@ -383,7 +383,7 @@ generate(seed, max_len):
 
 ---
 
-## 11. SNN — Rede Neural Spiking (T3 Alternativo)
+## 11. SNN — Rede Neural Spiking (Classificador POS)
 
 Documento completo em `ARCHITECTURE_SNN.md`. Resumo:
 
@@ -392,15 +392,69 @@ Input Layer (30 neurônios)
   ↓ rate-coded: class(7) + gender(2) + number(2) + tense(5) + person(3) + style(3) + syn_func(8)
 Hidden Layer (263 neurônios)
   ↓ 7 por classe + 256 por T3 key, pesos I→H seletivos por feature
-Output Layer (N neurônios = vocab)
-  ↓ 1 por lex_id, pesos H→O distribuídos por T3 key
+Output Layer (7 neurônios = classes POS)
+  ↓ 1 por classe: SUBST(0), VERBO(1), ADJ(2), ART(3), ADV(4), PREP/CONJ(5), PONT(6)
 16 timesteps LIF (tau=5.0, threshold=1.0, refrac=2)
-Score = potencial membrana acumulado + bônus spikes
+STDP: 10 épocas, lr=0.001, Top-1=82.8%, Top-3=86.0%
 ```
 
-- **Treinamento**: pesos extraídos das tabelas T3 (coocorrência)
-- **Inferência**: 16 iterações de simulação temporal
+- **Treinamento**: pesos extraídos das tabelas T3 + STDP iterativo (1055 exemplos)
+- **Inferência**: 16 iterações de simulação temporal → 7 probabilidades de classe
+- **Uso**: SNN prediz classe POS → T3 refina dentro dela → GRAPH desempata
 - **GGUF**: `snn.synapses_ih`, `snn.synapses_ho`, `snn.output_labels`
+
+### Arquitetura re-escrita (v6)
+
+| Métrica | Antes (v5) | Agora (v6) |
+|---------|-----------|------------|
+| Output neurons | N (50K+ vocab) | **7** (classes POS) |
+| STDP Top-1 | 0.0% | **82.8%** |
+| STDP Top-3 | 0.0% | **86.0%** |
+| Exemplos treino | 57.445 | **1.055** |
+| Velocidade treino | 15min+ (timeout) | **~30s** |
+
+---
+
+## 12. Geração por Frazes (v6)
+
+Pipeline de geração re-escrito com backoff estruturado:
+
+```
+1. CUBO hierárquico prediz classe POS (via estrutura sintática)
+2. T3 lexicon fornece P(palavra | morph, syn_func, style)
+3. Amostra entre top-16 candidatos com temperatura
+4. GRAPH modula CUBO (Hamming distance nos embeddings)
+5. SNN confirma classe POS (Top-1=82.8%)
+```
+
+### Backoff estruturado
+
+```
+CUBO → classe predita → T3 refina → GRAPH desempata
+  ↓         ↓              ↓            ↓
+CUBO(v9)  7 classes    1.055 keys   PPMI embeddings
+```
+
+### Pipeline de treinamento (corpus misto)
+
+```
+Wikipédia PT (278 artigos, 1.670 KB)
+  + 5 romances Gutenberg (1.515 KB)
+  = 3.185 KB totais
+  → 510.291 tokens compilados
+  → HMM POS tagging automático
+  → 1.055 T3 entries, 50.030 GRAPH embeddings
+```
+
+### Romances do corpus narrativo
+
+| Texto | Autor | Tokens |
+|-------|-------|--------|
+| Iracema | José de Alencar | 27K |
+| O Guarany | José de Alencar | 56K |
+| A Pata da Gazela | José de Alencar | 34K |
+| Quincas Borba | Machado de Assis | 75K |
+| Yayá Garcia | Machado de Assis | 55K |
 
 ---
 

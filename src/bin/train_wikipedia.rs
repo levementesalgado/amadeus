@@ -252,13 +252,13 @@ fn main() {
     println!();
 
     // ─── FASE 5: Construir GRAPH embeddings ───
-    println!("▸ FASE 5: Construindo GRAPH embeddings...");
+    println!("▸ FASE 5: Construindo GRAPH embeddings (PPMI 32 dims)...");
 
     // Co-ocorrência com PMI para embeddings semânticos reais
     let mut graph: HashMap<u32, u32> = HashMap::new();
     let mut rng = fastrand::Rng::with_seed(42);
 
-    let window_size = 3;
+    let window_size = 5; // Janela maior = mais contexto semântico
     let mut cooccurrence: HashMap<(u32, u32), f32> = HashMap::new();
     let mut word_freq: HashMap<u32, f32> = HashMap::new();
     let mut total_pairs = 0.0f32;
@@ -273,13 +273,17 @@ fn main() {
             let context = window[i];
             if context.lex == 0 { continue; }
 
+            // Peso decrescente com distância (closer = more important)
+            let dist = (i as i32 - window_size as i32 / 2).unsigned_abs() as f32;
+            let weight = 1.0 / (1.0 + dist);
+
             let key = if center.lex < context.lex {
                 (center.lex, context.lex)
             } else {
                 (context.lex, center.lex)
             };
-            *cooccurrence.entry(key).or_insert(0.0) += 1.0;
-            total_pairs += 1.0;
+            *cooccurrence.entry(key).or_insert(0.0) += weight;
+            total_pairs += weight;
         }
     }
 
@@ -325,7 +329,12 @@ fn main() {
         let mut embedding: u32 = 0;
 
         if let Some(neighbors) = lex_ppmi.get(&lex_id) {
-            for &(other, ppmi) in neighbors {
+            // Top-K vizinhos por PPMI (manter só os mais relevantes)
+            let mut top_neighbors = neighbors.clone();
+            top_neighbors.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            top_neighbors.truncate(64); // top 64 por embedding
+
+            for &(other, ppmi) in &top_neighbors {
                 if (other as usize) < projection[0].len() {
                     for dim in 0..n_dims {
                         // PPMI pondera a projeção
@@ -344,7 +353,7 @@ fn main() {
     grammar.graph = graph.clone();
     grammar.graph_alpha = 0.3; // Peso da modulação semântica
 
-    println!("  GRAPH: {} embeddings criados", graph.len());
+    println!("  GRAPH: {} embeddings criados (janela=5, top-64 vizinhos)", graph.len());
     println!();
 
     // ─── FASE 6: Métricas ───
@@ -376,8 +385,8 @@ fn main() {
     }
     println!();
 
-    // ─── FASE 7: Gerar texto com GRAPH modulation ───
-    println!("▸ FASE 7: Gerando texto com GRAPH modulation...");
+    // ─── FASE 7: Gerar texto com coesão semântica ───
+    println!("▸ FASE 7: Gerando texto com coesão semântica...");
 
     // Sementes variadas
     let seeds = vec![
@@ -411,6 +420,29 @@ fn main() {
             .collect();
 
         println!("  \"{}\" → {}", seed, words.join(" "));
+    }
+
+    // Testar geração com SNN
+    println!();
+    println!("  Geração com SNN + coesão:");
+    grammar.build_snn();
+    grammar.train_snn_iterative(10, 0.001);
+
+    for seed in &seeds[..3] {
+        let seed_tokens = compiler.compile(seed);
+        if seed_tokens.is_empty() { continue; }
+        let generated = grammar.generate_with_snn(&seed_tokens, 20);
+
+        let reverse: HashMap<u32, &str> = compiler.lexicon.iter()
+            .map(|(w, &(id, _, _, _))| (id, w.as_str()))
+            .collect();
+
+        let words: Vec<&str> = generated.iter()
+            .filter(|t| t.lex != 0)
+            .filter_map(|t| reverse.get(&t.lex).copied())
+            .collect();
+
+        println!("  \"{}\" (SNN) → {}", seed, words.join(" "));
     }
 
     println!();

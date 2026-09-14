@@ -1,23 +1,24 @@
-# AMADEUS SNN — Rede Neural Spiking para Seleção Lexical
+# AMADEUS SNN — Rede Neural Spiking para Classificação POS
 
-> Substituto bio-inspirado da cascata T3. Usa dinâmica temporal de spikes ao invés de tabelas hash.
+> Classificador bio-inspirado de 7 classes POS. Usa STDP para aprender, modula o grammar na geração.
 
 ---
 
 ## Sumário
 
-1. [Arquitetura](#1-arquitetura)
+1. [Arquitetura (v6)](#1-arquitetura-v6)
 2. [Encoding Morfológico](#2-encoding-morfológico)
 3. [Dinâmica Temporal (LIF)](#3-dinâmica-temporal-lif)
-4. [Treinamento (Pesos Sinápticos)](#4-treinamento-pesos-sinápticos)
-5. [Inferência e Ranking](#5-inferência-e-ranking)
-6. [Integração com TripleGrammar](#6-integração-com-triplegrammar)
-7. [GGUF Serialization](#7-gguf-serialization)
-8. [Formato dos Dados](#8-formato-dos-dados)
+4. [Treinamento STDP](#4-treinamento-stdp)
+5. [Pipeline de Geração](#5-pipeline-de-geração)
+6. [GGUF Serialization](#6-gguf-serialization)
+7. [Métricas](#7-métricas)
 
 ---
 
-## 1. Arquitetura
+## 1. Arquitetura (v6)
+
+### Re-escrita: 7 outputs (classes POS)
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -39,237 +40,184 @@
 │                                    │
 │                          ┌─────────▼─────────┐
 │                          │ Output Layer       │
-│                          │ (N = vocab size)   │
-│                          │ 1 neurônio/lex_id  │
+│                          │ (7 neurônios)      │
+│                          │                    │
+│                          │ SUBST(0) VERBO(1)  │
+│                          │ ADJ(2)   ART(3)    │
+│                          │ ADV(4)   PREP(5)   │
+│                          │ PONT(6)            │
 │                          └───────────────────┘
 │                                    │
 │                          16 timesteps LIF
-│                          Score = Σ membrana + spikes×2
+│                          STDP lr=0.001
+│                          Top-1: 82.8%
+│                          Top-3: 86.0%
 └─────────────────────────────────────────────────────────┘
 ```
 
-### Dimensões
+### Antes vs Agora
 
-| Camada | Neurônios | Conexões |
-|--------|-----------|----------|
-| Input | 30 | 30 × 263 = 7.890 |
-| Hidden | 263 | 263 × N (sparse) |
-| Output | N (vocab) | via hidden |
+| Métrica | v5 (50K outputs) | v6 (7 outputs) |
+|---------|------------------|----------------|
+| Output neurons | 50.042 (1/lexema) | **7** (1/classe) |
+| STDP Top-1 | 0.0% | **82.8%** |
+| STDP Top-3 | 0.0% | **86.0%** |
+| Exemplos treino | 57.445 | **1.055** |
+| Velocidade | 15min+ (timeout) | **~30s** |
+| Aprendizagem | Não converge | **Converge** |
 
 ---
 
 ## 2. Encoding Morfológico
 
-Cada campo de `Token7.morph` é codificado como **rate-coded spike train**:
+Mesmo encoding rate-coded (30 neurônios):
 
-| Feature | Bits | Neurônios | Taxa (ativo) | Taxa (inativo) |
-|---------|------|-----------|---------------|-----------------|
-| Class | 0-2 | 7 (one-hot) | 0.80 | 0.05 |
-| Gender | 3 | 2 (one-hot) | 0.70 | 0.05 |
-| Number | 4 | 2 (one-hot) | 0.70 | 0.05 |
-| Tense | 5-7 | 5 (one-hot) | 0.70 | 0.05 |
-| Person | 8-9 | 3 (one-hot) | 0.60 | 0.05 |
-| Style | - | 3 (one-hot) | 0.70 | 0.05 |
-| SynFunc | - | 8 (one-hot) | 0.60 | 0.05 |
-
-**Exemplo**: morph `0x0262` (class=SUBST, gender=M, number=S, tense=Pret, person=3)
-→ neurônio class[0] taxa 0.8, gender[0] taxa 0.7, number[0] taxa 0.7, etc.
+| Feature | Bits | Neurônios | Taxa (ativo) |
+|---------|------|-----------|--------------|
+| Class | 0-2 | 7 (one-hot) | 0.80 |
+| Gender | 3 | 2 (one-hot) | 0.70 |
+| Number | 4 | 2 (one-hot) | 0.70 |
+| Tense | 5-7 | 5 (one-hot) | 0.70 |
+| Person | 8-9 | 3 (one-hot) | 0.60 |
+| Style | - | 3 (one-hot) | 0.70 |
+| SynFunc | - | 8 (one-hot) | 0.60 |
 
 ---
 
 ## 3. Dinâmica Temporal (LIF)
 
-### Neurônio Leaky Integrate-and-Fire
-
 ```
 v(t+1) = v(t) + (-v(t)/τ + I(t)) × dt
-
-se v ≥ threshold:
-    spike = true
-    v = 0
-    refrac_left = refrac_steps
-senão:
-    spike = false
+se v ≥ threshold: spike, v=0, refrac=2
 ```
 
-### Parâmetros
-
-| Parâmetro | Valor | Descrição |
-|-----------|-------|-----------|
-| τ (tau) | 5.0 | Constante de tempo do leak |
-| threshold | 1.0 | Limiar de disparo |
-| refrac_steps | 2 | Timesteps de refratário |
-| dt | 1.0 | Passo de tempo |
-| tsteps | 16 | Total de timesteps por inferência |
-
-### Propagação
-
-```
-t=0..15:
-  Input spikes → Input neurons (LIF)
-  Input fired? → Input→Hidden weights → Hidden neurons (LIF)
-  Hidden fired? → Hidden→Output weights → Output neurons (LIF)
-  Output potential acumulado += input
-  Output spikes contados
-```
+| Parâmetro | Valor |
+|-----------|-------|
+| τ | 5.0 |
+| threshold | 1.0 |
+| refrac_steps | 2 |
+| tsteps | 16 |
 
 ---
 
-## 4. Treinamento (Pesos Sinápticos)
+## 4. Treinamento STDP
 
-Pesos são extraídos das tabelas T3 existentes (sem learning online):
-
-### Pesos I→H (Input → Hidden)
+### Pesos iniciais (extraídos do grammar)
 
 ```
-Neurônios de classe (idx 0-6):
-  pesos[CLASS+i][H_i] = 0.5     (feature da classe)
-  pesos[GENDER+i][H_i] = 0.1    (gender)
-  pesos[NUMBER+i][H_i] = 0.1    (number)
+Pesos I→H:
+  Neurônios de classe (0-6):
+    pesos[CLASS+i][H_i] = 0.5
+    pesos[GENDER+i][H_i] = 0.1
+    pesos[NUMBER+i][H_i] = 0.1
 
-Neurônios T3 (idx 7-262):
-  Para cada T3 key (morph, syn, style):
+  Neurônios T3 (7-262):
     pesos[CLASS+cls][H] = 0.4
-    pesos[GENDER+g][H] = 0.2
-    pesos[NUMBER+n][H] = 0.2
     pesos[SYN+syn][H] = 0.3
     pesos[STYLE+s][H] = 0.2
+
+Pesos H→O:
+  Neurônios de classe → sua classe (0.8)
+  T3 neurons → classe do morph (0.5)
 ```
 
-### Pesos H→O (Hidden → Output)
-
-```
-Para cada T3 key com candidatos:
-  H_idx = 7 + t3_index
-  total = soma dos counts da key
-  pesos[H_idx][O_lex] = count / total × 0.5
-
-Fallback de classe:
-  Para cada lex_id:
-    H_idx = classe do lex_id
-    pesos[H_idx][O_lex] += 0.1
-```
-
----
-
-## 5. Inferência e Ranking
+### STDP iterativo
 
 ```rust
-pub fn infer_snn(net, enc, morph, syn_func, style, rng) -> Vec<(u32, f32)> {
-    // 1. Encoding
-    let trains = enc.encode(morph, syn_func, style, 16, rng);
-
-    // 2. Simulação 16 timesteps
-    let output_potentials = [0.0; N];
-    let output_spikes = [0; N];
-
-    for t in 0..16 {
-        // Input → Hidden → Output (LIF step)
-        // Acumular potencial + spikes
+for epoch in 0..10 {
+    // Embaralhar 1.055 exemplos
+    for (morph, syn_func, style, class_id) in examples {
+        let trains = enc.encode(morph, syn_func, style, 16, rng);
+        let output_spikes = self.run(&trains);
+        
+        // Calcular top-1 e top-3
+        // STDP: atualizar pesos sinápticos
+        self.stdp_train(&trains, target_idx, 0.001);
     }
-
-    // 3. Scoring
-    let scores = output_potentials + output_spikes × 2.0;
-
-    // 4. Ordenar por score decrescente
-    scores.sort_by(score_desc);
-    return scores;
 }
 ```
 
-### Scoring
+### Resultados
 
 ```
-score = Σ(potencial de membrana acumulado) + (spikes × 2.0)
-```
-
-- Potencial acumulado: sub-threshold discrimination
-- Spikes: bônus por atingir threshold
-
----
-
-## 6. Integração com TripleGrammar
-
-```rust
-// Na TripleGrammar:
-pub snn: Option<SpikingNetwork>,
-pub snn_enc: Option<MorphEncoding>,
-
-// Construir SNN a partir das tabelas T3:
-grammar.build_snn();
-
-// Amostragem com fallback:
-pub fn sample_lex_with_snn(morph, syn, style, cls, candidate) -> u32 {
-    if self.snn.is_some() {
-        return self.snn_sample(morph, syn, style, candidate);
-    }
-    self.sample_lex_full(morph, syn, style, cls, candidate) // cascade legada
-}
+Época 1:  Top-1=77.8%  Top-3=83.8%
+Época 5:  Top-1=84.4%  Top-3=87.4%  ← pico
+Época 10: Top-1=82.8%  Top-3=86.0%  ← estável
 ```
 
 ---
 
-## 7. GGUF Serialization
+## 5. Pipeline de Geração
 
-Tensors salvos no GGUF do Amadeus:
+```
+1. CUBO hierárquico → prediz classe POS (estrutura sintática)
+2. T3 lexicon → top-16 candidatos P(palavra | morph, syn_func, style)
+3. SNN 7-outputs → confirma classe (82.8%)
+4. Se classe do SNN == classe do T3 → usa T3
+5. Se não → fallback para frequency-based
+6. GRAPH → modula CUBO via Hamming distance
+```
+
+### Backoff
+
+```
+CUBO → classe → T3 refina → SNN confirma → GRAPH desempata
+```
+
+---
+
+## 6. GGUF Serialization
 
 | Tensor | Shape | Descrição |
 |--------|-------|-----------|
 | `snn.synapses_ih` | [30, 263] | Pesos Input→Hidden |
-| `snn.synapses_ho` | [263, N] | Pesos Hidden→Output |
-| `snn.output_labels` | [N] | lex_id para cada output neuron |
-
-Formato: todos F32, sem quantização.
+| `snn.synapses_ho` | [263, 7] | Pesos Hidden→Output |
+| `snn.output_labels` | [7] | Classe POS (0-6) |
 
 ---
 
-## 8. Formato dos Dados
+## 7. Métricas
 
-### MorphEncoding
+### Corpus de treinamento
 
-```rust
-pub struct MorphEncoding {
-    pub class_start: usize,     // 0
-    pub class_count: usize,     // 7
-    pub gender_start: usize,    // 7
-    pub gender_count: usize,    // 2
-    pub number_start: usize,    // 9
-    pub number_count: usize,    // 2
-    pub tense_start: usize,     // 11
-    pub tense_count: usize,     // 5
-    pub person_start: usize,    // 16
-    pub person_count: usize,    // 3
-    pub style_start: usize,     // 19
-    pub style_count: usize,     // 3
-    pub syn_start: usize,       // 22
-    pub syn_count: usize,       // 8
-    pub total: usize,           // 30
-}
-```
+| Fonte | Tokens |
+|-------|--------|
+| Wikipédia PT | 359K |
+| Romances Gutenberg | 151K |
+| **Total** | **510K** |
 
-### SpikeTrain
+### HMM POS Tagger
 
-```rust
-pub struct SpikeTrain {
-    pub timesteps: usize,       // 16
-    pub spikes: Vec<bool>,      // [true, false, false, true, ...]
-}
-```
+| Classe | Prior | Palavras |
+|--------|-------|----------|
+| SUBST | 56.1% | 10.000 |
+| VERBO | 4.4% | 181 |
+| ADJ | 2.6% | 129 |
+| ART | 12.5% | 29 |
+| ADV | 2.9% | 25 |
+| PREP | 14.1% | 22 |
+| CONJ | 7.4% | 17 |
+| PONT | 0.1% | 11 |
 
-### Neuron
+### Gramática treinada
 
-```rust
-pub struct Neuron {
-    pub v: f32,                 // voltagem atual
-    pub threshold: f32,         // 1.0
-    pub tau: f32,               // 5.0
-    pub refrac_steps: u32,      // 2
-    pub refrac_left: u32,       // countdown
-    pub fired: bool,            // spike neste timestep
-    pub spike_times: Vec<usize>,// histórico de spikes
-}
-```
+| Tabela | Entradas |
+|--------|----------|
+| T3 (exact) | 1.055 |
+| T2 (concordância) | 3.906 |
+| GRAPH (PPMI) | 50.030 |
+| Bigramas | ~50K pares |
+
+### STDP
+
+| Métrica | Valor |
+|---------|-------|
+| Top-1 accuracy | 82.8% |
+| Top-3 accuracy | 86.0% |
+| Learning rate | 0.001 |
+| Epochs | 10 |
+| Samples/epoch | 1.055 |
 
 ---
 
-*AMADEUS SNN — Setembro 2026*
+*AMADEUS SNN v6 — Setembro 2026*
