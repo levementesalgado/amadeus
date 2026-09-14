@@ -433,10 +433,19 @@ fn main() {
     // ─── 4. Quantizar embeddings float → 32-bit ───
     let mut graph: HashMap<u32, u32> = HashMap::new();
 
+    // Primeiro: embeddings morfológicos para TODAS as palavras (cobertura total)
+    for (word, &(lex_id, _, _, _)) in &compiler.lexicon {
+        if lex_id == 0 { continue; }
+        let morph_emb = morph_vocab.word_embedding(word);
+        if morph_emb != 0 {
+            graph.insert(lex_id, morph_emb);
+        }
+    }
+
+    // Depois: sobrepor com SVD para top-2000 (qualidade semântica)
     for (i, &(lex_id, _)) in freq_sorted.iter().enumerate() {
         let emb = &embeddings[i];
 
-        // Quantizar: cada bit = sinal do componente
         let mut bits: u32 = 0;
         for dim in 0..n_dims {
             if emb[dim] > 0.0 {
@@ -444,7 +453,6 @@ fn main() {
             }
         }
 
-        // Adicionar bits morfológicos (XOR com afixos)
         let word = compiler.lexicon.iter()
             .find(|(_, v)| v.0 == lex_id)
             .map(|(w, _)| w.as_str())
