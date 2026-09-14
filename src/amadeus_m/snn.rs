@@ -236,6 +236,77 @@ impl SpikingNetwork {
         output_spike_times
     }
 
+    /// Run SNN without resetting membrane potential (recurrent memory)
+    pub fn run_recurrent(&mut self, input_spikes: &[SpikeTrain]) -> Vec<Vec<usize>> {
+        let mut output_spike_times = vec![Vec::new(); self.output_neurons.len()];
+
+        let mut input_fired = vec![0.0f32; self.input_neurons.len()];
+
+        for t in 0..self.tsteps {
+            for (i, train) in input_spikes.iter().enumerate() {
+                let spike_in = if t < train.timesteps && train.spikes[t] { 1.0 } else { 0.0 };
+                self.input_neurons[i].step(spike_in, self.dt, t);
+                input_fired[i] = if self.input_neurons[i].fired { 1.0 } else { 0.0 };
+            }
+
+            let n_hidden = self.hidden_neurons.len();
+            let mut hidden_input = vec![0.0f32; n_hidden];
+            for (i, ni_fired) in input_fired.iter().enumerate() {
+                if *ni_fired > 0.0 {
+                    let row = &self.synapses_ih[i];
+                    let chunks = row.len() / 4;
+                    for c in 0..chunks {
+                        let base = c * 4;
+                        hidden_input[base] += row[base];
+                        hidden_input[base + 1] += row[base + 1];
+                        hidden_input[base + 2] += row[base + 2];
+                        hidden_input[base + 3] += row[base + 3];
+                    }
+                    for h in (chunks * 4)..n_hidden {
+                        hidden_input[h] += row[h];
+                    }
+                }
+            }
+
+            for (h, nh) in self.hidden_neurons.iter_mut().enumerate() {
+                nh.step(hidden_input[h], self.dt, t);
+            }
+
+            let n_out = self.output_neurons.len();
+            let mut output_input = vec![0.0f32; n_out];
+            for (h, nh) in self.hidden_neurons.iter().enumerate() {
+                if nh.fired {
+                    let row = &self.synapses_ho[h];
+                    let chunks = row.len() / 4;
+                    for c in 0..chunks {
+                        let base = c * 4;
+                        output_input[base] += row[base];
+                        output_input[base + 1] += row[base + 1];
+                        output_input[base + 2] += row[base + 2];
+                        output_input[base + 3] += row[base + 3];
+                    }
+                    for o in (chunks * 4)..n_out {
+                        output_input[o] += row[o];
+                    }
+                }
+            }
+
+            for (o, no) in self.output_neurons.iter_mut().enumerate() {
+                no.step(output_input[o], self.dt, t);
+                if no.fired {
+                    output_spike_times[o].push(t);
+                }
+            }
+        }
+
+        output_spike_times
+    }
+
+    /// Reset only input neurons (for recurrent mode between tokens)
+    pub fn reset_inputs_only(&mut self) {
+        for n in self.input_neurons.iter_mut() { n.reset(); }
+    }
+
     // ─── STDP: Aprendizado por Timing de Spikes ───
     pub fn stdp_train(&mut self, input_spikes: &[SpikeTrain], target_output: usize, learning_rate: f32) {
         let output_spike_times = self.run(input_spikes);
@@ -617,6 +688,67 @@ pub fn infer_snn(
     sorted
 }
 
+/// Inferência SNN recorrente: mantém potencial de membrana entre tokens
+pub fn infer_snn_recurrent(
+    net: &mut SpikingNetwork,
+    enc: &MorphEncoding,
+    morph: u16,
+    syn_func: u8,
+    style: u16,
+    rng: &mut fastrand::Rng,
+) -> Vec<(u32, f32)> {
+    let trains = enc.encode(morph, syn_func, style, net.tsteps, rng);
+
+    let mut output_potentials = vec![0.0f32; net.output_neurons.len()];
+    let mut output_spikes = vec![0u32; net.output_neurons.len()];
+
+    // NÃO reseta — membrana persiste entre tokens
+    for t in 0..net.tsteps {
+        for (i, train) in trains.iter().enumerate() {
+            let spike_in = if t < train.timesteps && train.spikes[t] { 1.0 } else { 0.0 };
+            net.input_neurons[i].step(spike_in, net.dt, t);
+        }
+
+        let mut hidden_input = vec![0.0f32; net.hidden_neurons.len()];
+        for (i, ni) in net.input_neurons.iter().enumerate() {
+            if ni.fired {
+                for (h, &w) in net.synapses_ih[i].iter().enumerate() {
+                    hidden_input[h] += w;
+                }
+            }
+        }
+        for (h, nh) in net.hidden_neurons.iter_mut().enumerate() {
+            nh.step(hidden_input[h], net.dt, t);
+        }
+
+        let mut output_input = vec![0.0f32; net.output_neurons.len()];
+        for (h, nh) in net.hidden_neurons.iter().enumerate() {
+            if nh.fired {
+                for (o, &w) in net.synapses_ho[h].iter().enumerate() {
+                    output_input[o] += w;
+                }
+            }
+        }
+        for (o, no) in net.output_neurons.iter_mut().enumerate() {
+            no.step(output_input[o], net.dt, t);
+            output_potentials[o] += output_input[o];
+            if no.fired {
+                output_spikes[o] += 1;
+            }
+        }
+    }
+
+    let scores: Vec<(u32, f32)> = output_potentials.iter().enumerate().map(|(i, &pot)| {
+        let spike_bonus = output_spikes[i] as f32 * 2.0;
+        let score = pot + spike_bonus;
+        (net.output_labels[i], score)
+    }).filter(|(_, s)| *s > 0.01).collect();
+
+    let mut sorted = scores;
+    sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    sorted
+}
+
 // ─── Interface unificada: substitui T3 cascade ───
 
 pub fn snn_sample_lex(
@@ -630,7 +762,6 @@ pub fn snn_sample_lex(
     exploration_rate: f32,
     rng: &mut fastrand::Rng,
 ) -> u32 {
-    // SNN retorna probabilidades de classe POS (7 classes)
     let class_scores = infer_snn(net, enc, morph, syn_func, style, rng);
 
     if rng.f32() < exploration_rate {
@@ -641,8 +772,35 @@ pub fn snn_sample_lex(
         return candidate;
     }
 
-    // Retorna a classe POS mais provável como índice
-    // O caller (grammar) usa isso para modular a distribuição
+    if let Some(&(best_class, _score)) = class_scores.first() {
+        return best_class;
+    }
+
+    candidate
+}
+
+/// Amostragem SNN recorrente: membrana persiste entre chamadas
+pub fn snn_sample_lex_recurrent(
+    net: &mut SpikingNetwork,
+    enc: &MorphEncoding,
+    morph: u16,
+    syn_func: u8,
+    style: u16,
+    candidate: u32,
+    temperature: f32,
+    exploration_rate: f32,
+    rng: &mut fastrand::Rng,
+) -> u32 {
+    let class_scores = infer_snn_recurrent(net, enc, morph, syn_func, style, rng);
+
+    if rng.f32() < exploration_rate {
+        if !class_scores.is_empty() {
+            let idx = rng.usize(0..class_scores.len());
+            return class_scores[idx].0;
+        }
+        return candidate;
+    }
+
     if let Some(&(best_class, _score)) = class_scores.first() {
         return best_class;
     }

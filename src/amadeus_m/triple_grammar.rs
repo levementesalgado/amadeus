@@ -153,6 +153,16 @@ impl TripleGrammar {
         )
     }
 
+    /// SNN recorrente: mantém membrana entre tokens
+    pub fn snn_sample_recurrent(&mut self, morph: u16, syn_func: u8, style: u16, candidate: u32) -> u32 {
+        let net = self.snn.as_mut().unwrap();
+        let enc = self.snn_enc.as_ref().unwrap();
+        crate::amadeus_m::snn::snn_sample_lex_recurrent(
+            net, enc, morph, syn_func, style,
+            candidate, self.temperature, self.exploration_rate, &mut self.rng,
+        )
+    }
+
     // ─── Amostragem com fallback: SNN → cascade legada ───
 
     pub fn sample_lex_with_snn(&mut self, morph: u16, syn_func: u8, style: u16, cls: u8, candidate: u32) -> u32 {
@@ -1061,8 +1071,8 @@ impl TripleGrammar {
             // 2. Refinar morph/style
             let refined = self.refine_token(&out, cubo_lex);
 
-            // 3. SNN prediz classe POS
-            let snn_class = self.snn_sample(refined.morph, refined.syn_func, refined.style, cubo_lex) as u8;
+            // 3. SNN prediz classe MODOS (recorrente: membrana persiste)
+            let snn_class = self.snn_sample_recurrent(refined.morph, refined.syn_func, refined.style, cubo_lex) as u8;
 
             // 4. Amostragem coesa (T3 + GRAPH)
             let cohesive_lex = self.sample_cohesive(
