@@ -42,6 +42,10 @@ pub struct TripleGrammar {
     // SNN para T3
     pub snn: Option<crate::amadeus_m::snn::SpikingNetwork>,
     pub snn_enc: Option<crate::amadeus_m::snn::MorphEncoding>,
+    // Bigramas: P(next | prev2, prev1)
+    pub context_bigrams: HashMap<(u32, u32), HashMap<u32, f32>>,
+    pub context_totals: HashMap<(u32, u32), f32>,
+    pub unigrams: HashMap<u32, f32>,
 }
 
 impl TripleGrammar {
@@ -74,6 +78,9 @@ impl TripleGrammar {
             rng: fastrand::Rng::new(),
             snn: None,
             snn_enc: None,
+            context_bigrams: HashMap::new(),
+            context_totals: HashMap::new(),
+            unigrams: HashMap::new(),
         }
     }
 
@@ -198,6 +205,93 @@ impl TripleGrammar {
         modulated.last().map(|&(id, _)| id).unwrap_or(candidate)
     }
 
+    // ─── Amostragem com contexto (bigramas) ───
+    pub fn sample_lex_with_context(
+        &mut self,
+        morph: u16,
+        syn_func: u8,
+        style: u16,
+        cls: u8,
+        candidate: u32,
+        prev2_lex: u32,
+        prev1_lex: u32,
+        context_weight: f32,
+    ) -> u32 {
+        // 1. Distribuição morfológica do grammar
+        let key_exact = (morph, syn_func, style);
+        let key_css = (cls, syn_func, style);
+        let key_cs = (cls, syn_func);
+
+        let morph_dist: Vec<(u32, f32)> = self.lexicon.get(&key_exact)
+            .or(self.lexicon_cls_syn_style.get(&key_css))
+            .or(self.lexicon_cls_syn.get(&key_cs))
+            .or(self.lexicon_class.get(&cls))
+            .map(|m| {
+                let total: f32 = m.values().sum();
+                if total > 0.0 {
+                    m.iter().map(|(&id, &count)| (id, count / total)).collect()
+                } else {
+                    Vec::new()
+                }
+            })
+            .unwrap_or_default();
+
+        // 2. Distribuição de contexto (bigramas)
+        let ctx_key = (prev2_lex, prev1_lex);
+        let ctx_dist: Vec<(u32, f32)> = if let Some(candidates) = self.context_bigrams.get(&ctx_key) {
+            let total = self.context_totals.get(&ctx_key).copied().unwrap_or(1.0);
+            candidates.iter().map(|(&id, &count)| (id, count / total)).collect()
+        } else {
+            // Fallback: bigramas por classe (P(next | prev_class))
+            let prev1_class = self.lex_to_class.get(&prev1_lex).copied().unwrap_or(0);
+            let mut class_words: Vec<(u32, f32)> = Vec::new();
+            for (&id, &cls) in &self.lex_to_class {
+                if cls == prev1_class && id != prev1_lex {
+                    let freq = self.unigrams.get(&id).copied().unwrap_or(0.0);
+                    if freq > 0.0 {
+                        class_words.push((id, freq));
+                    }
+                }
+            }
+            let total: f32 = class_words.iter().map(|(_, f)| f).sum();
+            if total > 0.0 {
+                class_words.iter().map(|&(id, f)| (id, f / total * 0.5)).collect()
+            } else {
+                Vec::new()
+            }
+        };
+
+        // 3. Combinar distribuições
+        let mut combined: HashMap<u32, f32> = HashMap::new();
+
+        for &(id, prob) in &morph_dist {
+            *combined.entry(id).or_insert(0.0) += prob * (1.0 - context_weight);
+        }
+        for &(id, prob) in &ctx_dist {
+            *combined.entry(id).or_insert(0.0) += prob * context_weight;
+        }
+
+        if combined.is_empty() {
+            return candidate;
+        }
+
+        // 4. Amostrar
+        let total: f32 = combined.values().sum();
+        if total <= 0.0 {
+            return candidate;
+        }
+
+        let mut r = self.rng.f32() * total;
+        for (&id, &prob) in &combined {
+            r -= prob;
+            if r <= 0.0 {
+                return id;
+            }
+        }
+
+        *combined.keys().next().unwrap_or(&candidate)
+    }
+
     // ─── Rastreio de profundidade de cláusula ───
     // Heurística: PREP/ADV com syn_func de subordinação → push,
     // PONT final → pop. Durante treino, computamos do golden.
@@ -233,6 +327,24 @@ impl TripleGrammar {
     }
 
     pub fn train(&mut self, tokens: &[Token7]) {
+        // Bigramas: P(next | prev2, prev1)
+        for i in 2..tokens.len() {
+            if tokens[i].lex == 0 || tokens[i-1].lex == 0 || tokens[i-2].lex == 0 {
+                continue;
+            }
+            let key = (tokens[i-2].lex, tokens[i-1].lex);
+            let next = tokens[i].lex;
+            *self.context_bigrams.entry(key).or_default().entry(next).or_insert(0.0) += 1.0;
+            *self.context_totals.entry(key).or_insert(0.0) += 1.0;
+        }
+
+        // Unigramas
+        for t in tokens {
+            if t.lex != 0 {
+                *self.unigrams.entry(t.lex).or_insert(0.0) += 1.0;
+            }
+        }
+
         for i in 0..tokens.len() {
             let t = &tokens[i];
             let cls = t.morph_class();
@@ -510,7 +622,7 @@ impl TripleGrammar {
         out
     }
 
-    /// Geração usando SNN para seleção lexical ao invés da cascata T3
+    /// Geração usando SNN + bigramas para coesão
     pub fn generate_with_snn(&mut self, seed: &[Token7], max_len: usize) -> Vec<Token7> {
         if self.snn.is_none() {
             return self.generate(seed, max_len);
@@ -519,12 +631,12 @@ impl TripleGrammar {
         let mut out = seed.to_vec();
 
         for _ in 0..max_len {
-            // 1. CUBO prediz lex_id (modulação GRAPH)
             let syn_history = if out.len() >= 2 { assign_dependencies(&out) } else { out.clone() };
             let clause_depths = Self::compute_clause_depths(&syn_history);
             let temp = self.temperature.max(0.01);
-            let explore = self.exploration_rate;
+            let explore = self.rng.f32();
 
+            // 1. CUBO prediz lex_id
             let cubo_lex = if self.graph_alpha > 0.0 && !self.graph.is_empty() {
                 self.hier.clause.sample_lex_modulated(&syn_history, &clause_depths, temp, explore, &mut self.rng, Some(&self.graph), self.graph_alpha)
             } else {
@@ -533,12 +645,34 @@ impl TripleGrammar {
 
             if cubo_lex == 0 { break; }
 
-            // 2. refine_token já faz T2 + T3: usa o lex do CUBO e refina morph/style
+            // 2. Refinar morph/style
             let refined = self.refine_token(&out, cubo_lex);
 
-            // 3. SNN substitui o T3: recomputa lex com SNN
-            let snn_lex = self.snn_sample(refined.morph, refined.syn_func, refined.style, cubo_lex);
-            let final_lex = if snn_lex != 0 { snn_lex } else { cubo_lex };
+            // 3. SNN prediz classe POS
+            let snn_class = self.snn_sample(refined.morph, refined.syn_func, refined.style, cubo_lex) as u8;
+
+            // 4. Usar bigramas + SNN class para amostrar lexema final
+            let (prev2, prev1) = if out.len() >= 2 {
+                (out[out.len() - 2].lex, out[out.len() - 1].lex)
+            } else if out.len() == 1 {
+                (0, out[out.len() - 1].lex)
+            } else {
+                (0, 0)
+            };
+
+            let ctx_lex = self.sample_lex_with_context(
+                refined.morph, refined.syn_func, refined.style,
+                refined.morph_class(), cubo_lex, prev2, prev1, 0.8,
+            );
+
+            // 5. SNN modula: se classe do SNN bate com classe do ctx_lex, usar ctx_lex
+            let ctx_class = self.lex_to_class.get(&ctx_lex).copied().unwrap_or(0);
+            let final_lex = if ctx_class == snn_class || snn_class == 0 {
+                ctx_lex
+            } else {
+                // Fallback: grammar morfológica
+                self.sample_lex_full(refined.morph, refined.syn_func, refined.style, refined.morph_class(), cubo_lex)
+            };
 
             let final_token = Token7::new(final_lex, refined.morph)
                 .with_syn(refined.syn_off, refined.syn_func)

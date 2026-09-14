@@ -381,8 +381,8 @@ fn main() {
         let seed_tokens = compiler.compile(seed);
         if seed_tokens.is_empty() { continue; }
 
-        // Gerar com GRAPH modulation
-        let generated = grammar.generate(&seed_tokens, 15);
+        // Gerar com SNN + bigramas
+        let generated = grammar.generate_with_snn(&seed_tokens, 15);
 
         // Decompilar
         let reverse: HashMap<u32, &str> = compiler.lexicon.iter()
