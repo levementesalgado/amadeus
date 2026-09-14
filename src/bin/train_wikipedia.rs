@@ -317,8 +317,8 @@ fn main() {
     println!("  Treinamento concluído");
     println!();
 
-    // ─── FASE 5: Construir GRAPH embeddings morfológicos ───
-    println!("▸ FASE 5: Construindo GRAPH embeddings morfológicos...");
+    // ─── FASE 5: Construir GRAPH embeddings via SVD ───
+    println!("▸ FASE 5: Construindo GRAPH embeddings (SVD sobre co-ocorrência)...");
 
     // Criar vocabulário de afixos
     let morph_vocab = AffixVocabulary::new();
@@ -328,48 +328,7 @@ fn main() {
     // Coletar todas as palavras do léxico
     let word_list: Vec<String> = compiler.lexicon.keys().cloned().collect();
 
-    // Embeddings morfológicos: XOR dos bits dos afixos
-    let mut graph: HashMap<u32, u32> = HashMap::new();
-
-    for (word, &(lex_id, _, _, _)) in &compiler.lexicon {
-        if lex_id == 0 { continue; }
-
-        // Decompor palavra em afixos
-        let (prefix, root, suffix) = morph_vocab.decompose(word);
-
-        // Calcular embedding como XOR dos bits dos afixos
-        let mut embedding: u32 = 0;
-        if let Some(id) = prefix {
-            if let Some(&bits) = morph_vocab.affix_bits.get(&id) {
-                embedding ^= bits;
-            }
-        }
-        if let Some(id) = root {
-            if let Some(&bits) = morph_vocab.affix_bits.get(&id) {
-                embedding ^= bits;
-            }
-        }
-        if let Some(id) = suffix {
-            if let Some(&bits) = morph_vocab.affix_bits.get(&id) {
-                embedding ^= bits;
-            }
-        }
-
-        // Fallback: hash da palavra inteira
-        if embedding == 0 {
-            let mut hash: u32 = 0x811c9dc5;
-            for byte in word.bytes() {
-                hash ^= byte as u32;
-                hash = hash.wrapping_mul(0x01000193);
-            }
-            embedding = hash;
-        }
-
-        graph.insert(lex_id, embedding);
-    }
-
-    // Adicionar embeddings PPMI para palavras sem afixos conhecidos
-    // (usar janela=5, top-64 vizinhos como antes)
+    // ─── 1. Construir matriz de co-ocorrência ───
     let window_size = 5;
     let mut cooccurrence: HashMap<(u32, u32), f32> = HashMap::new();
     let mut word_freq: HashMap<u32, f32> = HashMap::new();
@@ -398,7 +357,7 @@ fn main() {
         }
     }
 
-    // PMI
+    // ─── 2. PPMI sobre co-ocorrência ───
     let mut pmi_scores: HashMap<(u32, u32), f32> = HashMap::new();
     for (&(a, b), &count) in &cooccurrence {
         let p_ab = count / total_pairs;
@@ -410,64 +369,98 @@ fn main() {
         }
     }
 
-    // Projeção aleatória para PPMI
-    let n_dims = 32;
-    let mut rng = fastrand::Rng::with_seed(42);
-    let mut projection: Vec<Vec<i8>> = Vec::new();
-    for _ in 0..n_dims {
-        let mut row: Vec<i8> = Vec::new();
-        for _ in 0..compiler.roots.len() { row.push(rng.i8(-1..=1)); }
-        projection.push(row);
-    }
-
-    let mut lex_ids: Vec<u32> = compiler.lexicon.values()
-        .map(|&(id, _, _, _)| id)
-        .filter(|&id| id > 0)
+    // ─── 3. SVD simplificado: power iteration para top-k vetores ───
+    // Mapear lex_ids para índices — apenas top-2000 mais frequentes
+    let mut freq_sorted: Vec<(u32, f32)> = word_freq.iter()
+        .map(|(&id, &freq)| (id, freq))
         .collect();
-    lex_ids.sort();
-    lex_ids.dedup();
+    freq_sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    freq_sorted.truncate(2000);
 
-    // Inverter PPMI
-    let mut lex_ppmi: HashMap<u32, Vec<(u32, f32)>> = HashMap::new();
-    for (&(a, b), &pmi) in &pmi_scores {
-        lex_ppmi.entry(a).or_default().push((b, pmi));
-        lex_ppmi.entry(b).or_default().push((a, pmi));
-    }
+    let n_words = freq_sorted.len();
+    let lex_to_idx: HashMap<u32, usize> = freq_sorted.iter()
+        .enumerate()
+        .map(|(i, &(id, _))| (id, i))
+        .collect();
 
-    // Combinar: morphological XOR PPMI para palavras com poucos afixos
-    for &lex_id in &lex_ids {
-        // Se já tem embedding morfológico, pular
-        if graph.contains_key(&lex_id) {
-            continue;
+    let n_dims = 32;
+    let n_iters = 5;
+
+    let mut embeddings: Vec<Vec<f32>> = vec![vec![0.0; n_dims]; n_words];
+
+    let mut rng = fastrand::Rng::with_seed(42);
+    for dim in 0..n_dims {
+        let mut v: Vec<f32> = (0..n_words).map(|_| rng.f32() - 0.5).collect();
+        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 0.0 { v.iter_mut().for_each(|x| *x /= norm); }
+
+        for _ in 0..n_iters {
+            let mut u: Vec<f32> = vec![0.0; n_words];
+            for (&(a, b), &ppmi) in &pmi_scores {
+                if let (Some(&ia), Some(&ib)) = (lex_to_idx.get(&a), lex_to_idx.get(&b)) {
+                    u[ia] += ppmi * v[ib];
+                    u[ib] += ppmi * v[ia];
+                }
+            }
+
+            let mut v_new: Vec<f32> = vec![0.0; n_words];
+            for (&(a, b), &ppmi) in &pmi_scores {
+                if let (Some(&ia), Some(&ib)) = (lex_to_idx.get(&a), lex_to_idx.get(&b)) {
+                    v_new[ia] += ppmi * u[ib];
+                    v_new[ib] += ppmi * u[ia];
+                }
+            }
+
+            for d in 0..dim {
+                let dot: f32 = v_new.iter().enumerate().map(|(i, a)| a * embeddings[i][d]).sum();
+                for i in 0..n_words {
+                    v_new[i] -= dot * embeddings[i][d];
+                }
+            }
+
+            let norm: f32 = v_new.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if norm > 0.0 {
+                v_new.iter_mut().for_each(|x| *x /= norm);
+            }
+            v = v_new;
         }
 
-        let mut embedding: u32 = 0;
-        if let Some(neighbors) = lex_ppmi.get(&lex_id) {
-            let mut top_neighbors = neighbors.clone();
-            top_neighbors.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-            top_neighbors.truncate(64);
+        for i in 0..n_words {
+            embeddings[i][dim] = v[i];
+        }
+    }
 
-            for &(other, ppmi) in &top_neighbors {
-                if (other as usize) < projection[0].len() {
-                    for dim in 0..n_dims {
-                        if projection[dim][other as usize] as f32 * ppmi > 0.0 {
-                            embedding ^= 1 << dim;
-                        }
-                    }
-                }
+    // ─── 4. Quantizar embeddings float → 32-bit ───
+    let mut graph: HashMap<u32, u32> = HashMap::new();
+
+    for (i, &(lex_id, _)) in freq_sorted.iter().enumerate() {
+        let emb = &embeddings[i];
+
+        // Quantizar: cada bit = sinal do componente
+        let mut bits: u32 = 0;
+        for dim in 0..n_dims {
+            if emb[dim] > 0.0 {
+                bits |= 1 << dim;
             }
         }
 
-        if embedding != 0 {
-            graph.insert(lex_id, embedding);
-        }
+        // Adicionar bits morfológicos (XOR com afixos)
+        let word = compiler.lexicon.iter()
+            .find(|(_, v)| v.0 == lex_id)
+            .map(|(w, _)| w.as_str())
+            .unwrap_or("");
+
+        let morph_emb = morph_vocab.word_embedding(word);
+        bits ^= morph_emb;
+
+        graph.insert(lex_id, bits);
     }
 
     // Copiar GRAPH para a gramática
     grammar.graph = graph.clone();
     grammar.graph_alpha = 0.3;
 
-    // Mostrar estatísticas de decomposição
+    // Mostrar estatísticas
     let mut decomposed_count = 0;
     let mut total_count = 0;
     for word in &word_list {
@@ -481,19 +474,32 @@ fn main() {
         }
     }
 
-    println!("  GRAPH: {} embeddings (morfológicos + PPMI)", graph.len());
+    println!("  GRAPH: {} embeddings (SVD + morfológico)", graph.len());
     println!("  Decomposição: {}/{} palavras ({:.1}%)",
         decomposed_count, total_count,
         decomposed_count as f32 / total_count as f32 * 100.0);
 
-    // Mostrar exemplos de decomposição
-    println!("  Exemplos de decomposição:");
-    for word in &["invisível", "bonitas", "correndo", "brasileiro", "desconhecido"] {
-        let (p, r, s) = morph_vocab.decompose(word);
-        let p_str = p.map(|id| morph_vocab.id_to_affix[&id].as_str()).unwrap_or("-");
-        let r_str = r.map(|id| morph_vocab.id_to_affix[&id].as_str()).unwrap_or("-");
-        let s_str = s.map(|id| morph_vocab.id_to_affix[&id].as_str()).unwrap_or("-");
-        println!("    {} = {} + {} + {}", word, p_str, r_str, s_str);
+    // Mostrar exemplos de similaridade via SVD
+    println!("  Top-5 similar (SVD) para 'casa':");
+    if let Some(casa_id) = compiler.lexicon.get("casa").map(|v| v.0) {
+        if let Some(&casa_bits) = graph.get(&casa_id) {
+            let mut sims: Vec<(u32, f32)> = graph.iter()
+                .filter(|&(id, _)| *id != casa_id)
+                .map(|(id, bits)| {
+                    let dist = (casa_bits ^ *bits).count_ones() as f32;
+                    let sim = 1.0 - dist / 32.0;
+                    (*id, sim)
+                })
+                .collect();
+            sims.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            for &(id, sim) in sims.iter().take(5) {
+                let word = compiler.lexicon.iter()
+                    .find(|(_, v)| v.0 == id)
+                    .map(|(w, _)| w.as_str())
+                    .unwrap_or("?");
+                println!("    {} ({:.2})", word, sim);
+            }
+        }
     }
 
     println!();
