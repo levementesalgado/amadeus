@@ -126,17 +126,99 @@ impl TripleGrammar {
         let samples_per_epoch = 500.min(lexicon_clone.values().map(|m| m.len()).sum::<usize>());
 
         println!("    Treinando SNN por {} épocas (lr={})...", epochs, learning_rate);
-        let results = net.iterative_train(
-            &enc,
-            &lexicon_clone,
-            epochs,
-            learning_rate,
-            samples_per_epoch,
-        );
+
+        // ─── Early Stopping: salvar melhor modelo ───
+        let mut best_top1 = 0.0f32;
+        let mut best_epoch = 0;
+        let mut best_weights_ih: Vec<Vec<f32>> = Vec::new();
+        let mut best_weights_ho: Vec<Vec<f32>> = Vec::new();
+
+        let mut results = Vec::new();
+        let mut rng = fastrand::Rng::with_seed(42);
+
+        // Extrair exemplos de treino
+        let mut training_examples: Vec<(u16, u8, u16, u32)> = Vec::new();
+        for (&(morph, syn_func, style), _candidates) in &lexicon_clone {
+            let class_id = (morph & 0x7) as u32;
+            training_examples.push((morph, syn_func, style, class_id));
+        }
+
+        if training_examples.is_empty() {
+            return;
+        }
+
+        for epoch in 0..epochs {
+            // Fisher-Yates shuffle
+            let n = training_examples.len();
+            for i in (1..n).rev() {
+                let j = rng.usize(0..=i);
+                training_examples.swap(i, j);
+            }
+
+            let n_samples = samples_per_epoch.min(training_examples.len());
+            let mut correct_top1 = 0usize;
+            let mut correct_top3 = 0usize;
+
+            for idx in 0..n_samples {
+                let (morph, syn_func, style, target_class) = training_examples[idx];
+
+                let trains = enc.encode(morph, syn_func, style, net.tsteps, &mut rng);
+                let output_spikes = net.run(&trains);
+
+                // Scores das 7 classes
+                let mut scores: Vec<(u32, f32)> = net.output_neurons.iter().enumerate()
+                    .map(|(i, n)| {
+                        let class_id = net.output_labels[i];
+                        let spike_count = output_spikes.get(i).map(|s| s.len()).unwrap_or(0) as f32;
+                        let potential: f32 = n.spike_times.iter().map(|&t| (-(t as f32) / 5.0).exp()).sum();
+                        (class_id, spike_count + potential)
+                    })
+                    .collect();
+                scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+                // Verificar acurácia
+                for (rank, &(class_id, _)) in scores.iter().take(3).enumerate() {
+                    if class_id == target_class {
+                        if rank == 0 { correct_top1 += 1; }
+                        correct_top3 += 1;
+                        break;
+                    }
+                }
+
+                // STDP de 3 fatores
+                if let Some(target_idx) = net.output_labels.iter().position(|&id| id == target_class) {
+                    let predicted_class = scores.first().map(|(c, _)| *c).unwrap_or(0);
+                    let modulator = if predicted_class == target_class { 1.0 } else { 0.3 };
+                    net.stdp_train_3factor(&trains, target_idx, learning_rate, modulator);
+                }
+            }
+
+            let acc_top1 = correct_top1 as f32 / n_samples as f32;
+            let acc_top3 = correct_top3 as f32 / n_samples as f32;
+            results.push((epoch + 1, acc_top1, acc_top3));
+
+            println!("    Época {}: Top-1={:.1}% Top-3={:.1}%", epoch + 1, acc_top1 * 100.0, acc_top3 * 100.0);
+
+            // ─── Early Stopping: salvar melhor modelo ───
+            if acc_top1 > best_top1 {
+                best_top1 = acc_top1;
+                best_epoch = epoch + 1;
+                best_weights_ih = net.synapses_ih.clone();
+                best_weights_ho = net.synapses_ho.clone();
+            }
+        }
+
+        // ─── Restaurar melhor modelo ───
+        if best_epoch < epochs {
+            println!("    Early stopping: restaurando época {} (Top-1={:.1}%)", best_epoch, best_top1 * 100.0);
+            self.snn.as_mut().unwrap().synapses_ih = best_weights_ih;
+            self.snn.as_mut().unwrap().synapses_ho = best_weights_ho;
+        }
 
         // Resumo final
         if let Some(&(_, last_top1, last_top3)) = results.last() {
             println!("    Treinamento concluído:");
+            println!("      Melhor época: {} (Top-1={:.1}%)", best_epoch, best_top1 * 100.0);
             println!("      Top-1 final: {:.1}%", last_top1 * 100.0);
             println!("      Top-3 final: {:.1}%", last_top3 * 100.0);
         }

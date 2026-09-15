@@ -50,14 +50,11 @@ impl HmmPosTagger {
 
     /// Inicializar com seeds de palavras funcionais (alta confiança)
     fn init_seeds(&mut self) {
-        // ─── PRIOR INICIAL (uniforme com viés) ───
-        self.prior_count[TAG_SUBST] = 30.0;  // Substantivos são comuns
-        self.prior_count[TAG_VERBO] = 25.0;  // Verbos também
-        self.prior_count[TAG_ADJ] = 15.0;    // Adjetivos moderados
-        self.prior_count[TAG_ART] = 10.0;    // Artigos em toda frase
-        self.prior_count[TAG_ADV] = 5.0;     // Advérbios menos frequentes
-        self.prior_count[TAG_PREP] = 10.0;   // Preposições comuns
-        self.prior_count[TAG_CONJ] = 5.0;    // Conjunções menos frequentes
+        // ─── PRIOR INICIAL (uniforme — balanced sampling) ───
+        // Todas as classes começam com peso igual
+        for tag in 0..N_TAGS {
+            self.prior_count[tag] = 10.0;
+        }
 
         // Artigos — inambíguos
         let arts = ["o", "os", "a", "as", "um", "uns", "uma", "umas"];
@@ -324,20 +321,11 @@ impl HmmPosTagger {
 
     /// Normalizar contadores em probabilidades
     fn normalize(&mut self) {
-        // Normalizar prior
-        let total_prior: f64 = self.prior_count.iter().sum();
-        if total_prior > 0.0 {
-            for i in 0..N_TAGS {
-                self.prior[i] = self.prior_count[i] / total_prior;
-                if self.prior[i] < 1e-10 {
-                    self.prior[i] = 1e-10; // Suavização
-                }
-            }
-        } else {
-            let uniform = 1.0 / N_TAGS as f64;
-            for i in 0..N_TAGS {
-                self.prior[i] = uniform;
-            }
+        // ─── PRIORS BALANCEADOS ───
+        // Forçar priors uniformes para balanced sampling
+        let uniform = 1.0 / N_TAGS as f64;
+        for i in 0..N_TAGS {
+            self.prior[i] = uniform;
         }
 
         // Normalizar transições

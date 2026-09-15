@@ -369,6 +369,27 @@ fn main() {
         }
     }
 
+    // ─── 2.1 Normalizar PPMI por linha (frequência da palavra) ───
+    // Isso evita que palavras frequentes dominem o SVD
+    let mut row_norms: HashMap<u32, f32> = HashMap::new();
+    for (&(a, _), &ppmi) in &pmi_scores {
+        *row_norms.entry(a).or_insert(0.0) += ppmi * ppmi;
+    }
+    for norm in row_norms.values_mut() {
+        *norm = norm.sqrt().max(1e-10);
+    }
+
+    // PPMI normalizado: ppmi / ||row||
+    let mut ppmi_normalized: HashMap<(u32, u32), f32> = HashMap::new();
+    for (&(a, b), &ppmi) in &pmi_scores {
+        if let Some(&row_norm) = row_norms.get(&a) {
+            ppmi_normalized.insert((a, b), ppmi / row_norm);
+        }
+    }
+
+    // Usar PPMI normalizado para SVD
+    let pmi_scores_for_svd = &ppmi_normalized;
+
     // ─── 3. SVD simplificado: power iteration para top-k vetores ───
     // Mapear lex_ids para índices — apenas top-2000 mais frequentes
     let mut freq_sorted: Vec<(u32, f32)> = word_freq.iter()
@@ -396,7 +417,7 @@ fn main() {
 
         for _ in 0..n_iters {
             let mut u: Vec<f32> = vec![0.0; n_words];
-            for (&(a, b), &ppmi) in &pmi_scores {
+            for (&(a, b), &ppmi) in pmi_scores_for_svd {
                 if let (Some(&ia), Some(&ib)) = (lex_to_idx.get(&a), lex_to_idx.get(&b)) {
                     u[ia] += ppmi * v[ib];
                     u[ib] += ppmi * v[ia];
@@ -404,7 +425,7 @@ fn main() {
             }
 
             let mut v_new: Vec<f32> = vec![0.0; n_words];
-            for (&(a, b), &ppmi) in &pmi_scores {
+            for (&(a, b), &ppmi) in pmi_scores_for_svd {
                 if let (Some(&ia), Some(&ib)) = (lex_to_idx.get(&a), lex_to_idx.get(&b)) {
                     v_new[ia] += ppmi * u[ib];
                     v_new[ib] += ppmi * u[ia];
