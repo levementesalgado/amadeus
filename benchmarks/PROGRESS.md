@@ -1,44 +1,45 @@
 # AMADEUS Progress Log
 
-## 2026-09-14 — v6.2: SVD + Recurrent SNN + 3-Factor STDP
+## 2026-09-15 — v6.3: Balanced HMM + PPMI Norm + Early Stopping + Corpus
 
 ### Melhorias implementadas
-1. **Style field no compilador**: `classify_style()` determina formal/informal/neutro por lexema
-   - T3: 1055→1350 (+28% cobertura)
-   - Critérios: sufixos técnicos, abreviações, diminutivos, termos jurídicos/médicos
+1. **Balanced HMM priors**: Priors uniformes (1/N_TAGS) para amostragem honesta
+   - Antes: SUBST=30, VERBO=25... (enviesado)
+   - Agora: todos = 10.0 (uniforme)
 
-2. **GRAPH via SVD**: power iteration sobre matriz de co-ocorrência PPMI
-   - Substitui random projection por fatoração real
-   - Top-2000 palavras recebem embeddings SVD (32-bit quantizados)
-   - Gram-Schmidt orthogonalization
+2. **PPMI row-normalized SVD**: PPMI normalizado por linha antes de SVD
+   - Previne palavras frequentes de dominar embeddings
 
-3. **SNN recorrente**: `infer_snn_recurrent()` mantém membrana entre tokens
-   - Sem reset entre chamadas
-   - Memória implícita no potencial de membrana
-   - Dependência de longo alcance sem aumentar neurons
+3. **Early stopping SNN**: Salva melhores pesos e restaura após treino
+   - Epoch 8: Top-1=90.6% (melhor)
+   - Epoch 10: Top-1=86.6% (final)
+   - Restaura epoch 8 automaticamente
 
-4. **3-Factor STDP**: `stdp_train_3factor(input, target, lr, modulator)`
-   - modulator=1.0 quando acerta (reforço)
-   - modulator=0.3 quando erra (fricção)
-   - LTP escalado pelo modulador, LTD reduzido quando confiante
+4. **Language filter**: Filtro de idioma para corpus
+   - Remove texto não-português (>2% chars PT ou 10+ palavras comuns)
+   - Strip Gutenberg headers/footers
+
+5. **Corpus expandido**: 21 arquivos narrativos (7.4MB)
+   - Machado de Assis, Aluísio Azevedo, José de Alencar, Coelho Neto
 
 ### Métricas finais
 
-| Componente | v6.0 | v6.2 |
+| Componente | v6.2 | v6.3 |
 |------------|------|------|
-| T3 | 1.055 | **1.350** |
-| T2 | 3.903 | **4.800** |
-| GRAPH | 50.030 (PPMI) | **2.000 (SVD)** |
-| SNN Top-1 | 82.0% | **89.2%** |
-| SNN Top-3 | 85.6% | **91.2%** |
+| Tokens | 510K | **1.19M** |
+| Léxico | 1.280 | **1.379** |
+| T3 | 1.350 | **1.379** |
+| T2 | 4.800 | **4.968** |
+| GRAPH | 50.030 (morph) | **99.301 (SVD+morph)** |
+| SNN Top-1 | 89.2% | **90.6%** |
+| SNN Top-3 | 91.2% | **92.8%** |
+| Early stop | não | **epoch 8** |
+| Self-play | 4% | **3%** |
 
 ### Commits
 ```
-1844b15 — 3-factor STDP (friction as reinforcement signal)
-75c412c — recurrent SNN (membrane persists between tokens)
-94d1b53 — GRAPH via SVD power iteration
-34b0dd0 — populate style field (28% T3 increase)
-c18b7f6 — documentation update v6.2
+af279e3 — language filter + early stopping + expanded corpus
+8ff9c28 — balanced HMM + PPMI normalization + early stopping SNN
 ```
 
 ---
