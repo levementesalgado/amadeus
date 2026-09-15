@@ -6,6 +6,90 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
+/// Strip Project Gutenberg header/footer from text
+fn strip_gutenberg(text: &str) -> String {
+    let markers_start = [
+        "*** START OF",
+        "*** START THE PROJECT GUTENBERG",
+        "*** INÍCIO DO PROJETO",
+        "INÍCIO DESTE PROJETO",
+        "*** BEGIN THE PROJECT GUTENBERG",
+    ];
+    let markers_end = [
+        "*** END OF",
+        "*** END THE PROJECT GUTENBERG",
+        "*** FIM DO PROJETO",
+        "FIM DESTE PROJETO",
+        "*** END THE SMALL PRINT",
+    ];
+
+    let mut start = 0;
+    for marker in &markers_start {
+        if let Some(pos) = text.find(marker) {
+            start = text[pos..].find('\n').map(|i| pos + i + 1).unwrap_or(pos + marker.len());
+            break;
+        }
+    }
+
+    let mut end = text.len();
+    for marker in &markers_end {
+        if let Some(pos) = text[start..].find(marker) {
+            end = start + pos;
+            break;
+        }
+    }
+
+    let cleaned = &text[start..end];
+    let lines: Vec<&str> = cleaned.lines().collect();
+    let mut skip = 0;
+    for line in &lines {
+        let l = line.to_lowercase();
+        if l.starts_with("project gutenberg") || l.starts_with("e-text") || l.starts_with("etext") || l.trim().is_empty() {
+            skip += 1;
+        } else {
+            break;
+        }
+    }
+    lines[skip..].join("\n")
+}
+
+/// Check if text is predominantly Portuguese (>60% Portuguese chars)
+fn is_portuguese(text: &str) -> bool {
+    if text.is_empty() { return false; }
+
+    // Find safe boundary at char boundary
+    let sample_len = text.len().min(5000);
+    let mut end = sample_len;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let sample = &text[..end];
+
+    // Portuguese-specific chars and common words
+    let pt_chars = ['ã', 'õ', 'á', 'é', 'í', 'ó', 'ú', 'â', 'ê', 'ô', 'ç', 'à'];
+    let pt_words = [" de ", " que ", " e ", " a ", " o ", " os ", " as ", " um ", " uma ", " para ", " com ", " não ", " se ", " na ", " no ", " por ", " mas ", " foi ", " do ", " da ", " dos ", " das "];
+
+    let mut pt_char_count = 0;
+    let mut pt_word_count = 0;
+
+    for c in sample.chars() {
+        if pt_chars.contains(&c) {
+            pt_char_count += 1;
+        }
+    }
+
+    let lower = sample.to_lowercase();
+    for word in &pt_words {
+        pt_word_count += lower.matches(word).count();
+    }
+
+    // Score: at least 2% Portuguese chars OR 10+ common words
+    let char_ratio = pt_char_count as f32 / sample_len.max(1) as f32;
+    let has_pt_words = pt_word_count >= 10;
+
+    char_ratio > 0.02 || has_pt_words
+}
+
 /// Compilador simplificado que aprende vocabulário diretamente do texto
 /// Usa HMM para classificação automática de palavras
 struct SimpleCompiler {
@@ -227,7 +311,7 @@ fn main() {
                     let file_name = path.file_stem()
                         .and_then(|s| s.to_str())
                         .unwrap_or("?");
-                    if content.len() > 100 {
+                    if content.len() > 100 && is_portuguese(&content) {
                         println!("    → {} ({} KB)", file_name, content.len() / 1024);
                         all_text.push_str(&content);
                         all_text.push('\n');
@@ -250,11 +334,14 @@ fn main() {
                         .and_then(|s| s.to_str())
                         .unwrap_or("?");
                     if content.len() > 1000 {
-                        println!("    → {} ({} KB)", file_name, content.len() / 1024);
-                        all_text.push_str(&content);
-                        all_text.push('\n');
-                        narrative_chars += content.len();
-                        file_count += 1;
+                        let cleaned = strip_gutenberg(&content);
+                        if cleaned.len() > 500 && is_portuguese(&cleaned) {
+                            println!("    → {} ({} KB)", file_name, cleaned.len() / 1024);
+                            all_text.push_str(&cleaned);
+                            all_text.push('\n');
+                            narrative_chars += cleaned.len();
+                            file_count += 1;
+                        }
                     }
                 }
             }
