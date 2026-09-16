@@ -1,4 +1,4 @@
-# Arquitetura do AMADEUS (v6.2 — SVD + Recurrent SNN + 3-Factor STDP)
+# Arquitetura do AMADEUS (v6.3 — Balanced HMM + PPMI Norm + Early Stopping)
 
 > *"Não é uma LLM. É uma pilha de lógica, filosofia e matemática que simula uma presença."*
 
@@ -16,9 +16,11 @@
 8. [Topic Tracking (Coesão Semântica)](#8-topic-tracking-coesão-semântica)
 9. [SNN — Rede Neural Spiking Recorrente](#9-snn--rede-neural-spiking-recorrente)
 10. [3-Factor STDP (Friction como Sinal)](#10-3-factor-stdp-friction-como-sinal)
-11. [Geração Top-Down](#11-geração-top-down)
-12. [Estado Atual (v6.2)](#12-estado-atual-v62)
-13. [Filosofia da Stack](#13-filosofia-da-stack)
+11. [Balanced HMM (Priors Uniformes)](#11-balanced-hmm-priors-uniformes)
+12. [Early Stopping (SNN)](#12-early-stopping-snn)
+13. [Geração Top-Down](#13-geração-top-down)
+14. [Estado Atual (v6.3)](#14-estado-atual-v63)
+15. [Filosofia da Stack](#15-filosofia-da-stack)
 
 ---
 
@@ -599,42 +601,44 @@ Documento completo em `ARCHITECTURE_HYBRID.md`. Resumo:
 
 ---
 
-## 13. Estado Atual (v6.2)
+## 13. Estado Atual (v6.3)
 
 ### Métricas
 
 | Componente | Métrica | Valor |
 |------------|---------|-------|
-| GRAPH | Embeddings | 2.000 (SVD) |
+| GRAPH | Embeddings | 99.301 (SVD + morfológico) |
 | GRAPH | Decomposição morfológica | 69.7% |
-| T3 | Entradas | 1.350 |
-| T2 | Padrões | 4.800 |
-| SNN | Top-1 | 89.2% |
-| SNN | Top-3 | 91.2% |
+| T3 | Entradas | 1.379 |
+| T2 | Padrões | 4.968 |
+| SNN | Top-1 | 90.6% |
+| SNN | Top-3 | 92.8% |
 | SNN | Recorrência | Sim |
 | SNN | STDP | 3-fator |
-| Corpus | Tokens | 510.291 |
+| SNN | Early Stop | epoch 8 |
+| HMM | Priors | Uniformes (1/N_TAGS) |
+| Corpus | Tokens | 1.195.694 |
+| Corpus | Arquivos | 21 narrativos |
 | Afixos | Componentes | 613 |
 | Topic | Momentum | 0.8 |
 | Topic | Alpha | 0.4 |
+| Self-play | Aprovação | 3% |
 
 ### Commits Recentes
 
 ```
+259f106 — docs: update PROGRESS.md with v6.3 metrics
+af279e3 — language filter + early stopping + expanded corpus
+8ff9c28 — balanced HMM + PPMI normalization + early stopping SNN
 1844b15 — 3-factor STDP (friction as reinforcement signal)
 75c412c — recurrent SNN (membrane persists between tokens)
 94d1b53 — GRAPH via SVD power iteration
 34b0dd0 — populate style field (28% T3 increase)
-9f3b02e — comprehensive documentation v6.1
-7aa1059 — suffix bonus in generation
-b5cd30b — expanded vocabulary (613 components)
-5b58bac — morphological vocabulary
-68dfd8d — topic tracking + cohesive sampling
 ```
 
 ### Documentação
 
-- `ARCHITECTURE.md` — Este arquivo (v6.2)
+- `ARCHITECTURE.md` — Este arquivo (v6.3)
 - `AMADEUS.md` — Visão geral
 - `ARCHITECTURE_SNN.md` — Rede Neural Spiking
 - `COESAO_SEMANTICA.md` — Coesão semântica + vocabulário morfológico
@@ -673,4 +677,4 @@ Fundação Matemática (Hardware)
 
 ---
 
-*AMADEUS v6.1 — Setembro 2026*
+*AMADEUS v6.3 — Setembro 2026*
