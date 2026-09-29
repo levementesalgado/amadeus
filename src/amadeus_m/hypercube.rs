@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use crate::amadeus_m::compact::{chave, Cands, CtxKey, FxHashMap};
 use crate::amadeus_m::token7::Token7;
 
 // ─── 8D packing: cada token de histórico → u128 ───
@@ -41,11 +42,13 @@ fn syn_bin(off: i16) -> u8 {
 
 pub struct HyperCube {
     pub order: usize,
-    // table: seq de packed tokens → distrib sobre lex
-    pub table: HashMap<Vec<u128>, HashMap<u32, f32>>,
-    pub totals: HashMap<Vec<u128>, f32>,
+    // Chave canônica u64 em vez de Vec<u128>, e Cands (Vec ordenado) em vez
+    // de HashMap interno. Ver `compact.rs` para a medição: 266 → 182 bytes por
+    // entrada, e FxHash em vez de SipHash.
+    pub table: FxHashMap<CtxKey, Cands>,
+    pub totals: FxHashMap<CtxKey, f32>,
     // unigram
-    pub unigram: HashMap<u32, f32>,
+    pub unigram: FxHashMap<u32, f32>,
     pub total_lex: f32,
     // pesos de interpolação fixos
     pub lambda: Vec<f32>,
@@ -56,8 +59,8 @@ pub struct HyperCube {
     /// Se true, `train()` faz flush periódico em vez de crescer em RAM.
     pub spill_enabled: bool,
     /// Contextos acumulados desde o último flush (modo spill).
-    pub pending: HashMap<Vec<u128>, HashMap<u32, f32>>,
-    pending_totals: HashMap<Vec<u128>, f32>,
+    pub pending: FxHashMap<CtxKey, Cands>,
+    pending_totals: FxHashMap<CtxKey, f32>,
     /// A cada quantos contextos acumulados acontece o flush.
     pub spill_threshold: usize,
 }
@@ -70,16 +73,16 @@ impl HyperCube {
         let unigram_weight = 0.10;
         Self {
             order,
-            table: HashMap::new(),
-            totals: HashMap::new(),
-            unigram: HashMap::new(),
+            table: FxHashMap::default(),
+            totals: FxHashMap::default(),
+            unigram: FxHashMap::default(),
             total_lex: 0.0,
             lambda,
             unigram_weight,
             shards: None,
             spill_enabled: false,
-            pending: HashMap::new(),
-            pending_totals: HashMap::new(),
+            pending: FxHashMap::default(),
+            pending_totals: FxHashMap::default(),
             spill_threshold: 2_000_000,
         }
     }
@@ -126,8 +129,8 @@ impl HyperCube {
         // `clear()` mantém a capacidade alocada — os buckets ficariam
         // reservados (GB) e a memória não cairia. `take` devolve um mapa vazio
         // e a alocação é devolvida ao allocator.
-        self.pending = HashMap::new();
-        self.pending_totals = HashMap::new();
+        self.pending = FxHashMap::default();
+        self.pending_totals = FxHashMap::default();
         Ok(Some(path))
     }
 
@@ -138,24 +141,19 @@ impl HyperCube {
     /// retreinado depois. Se o shard ganhasse, o treino recente seria
     /// silenciosamente ignorado.
     /// Retorna (candidatos, soma).
-    pub fn lookup_ctx(&mut self, ctx: &[u128]) -> Option<(HashMap<u32, f32>, f32)> {
-        if let Some(cands) = self.pending.get(ctx) {
+    pub fn lookup_ctx(&mut self, ctx: &[u128]) -> Option<(Cands, f32)> {
+        let k = chave(ctx);
+        if let Some(cands) = self.pending.get(&k) {
             // Some as contagens do shard antigo, para manter o histórico.
             let mut merged = cands.clone();
             if let Some(store) = self.shards.as_mut() {
                 if let Some((old, _)) = store.get(ctx) {
-                    for (&lex, &cnt) in &old {
-                        let e = merged.entry(lex).or_insert(0.0);
-                        *e += cnt;
-                    }
+                    merged.merge(&old, 1.0);
                 }
-            } else if let Some(old) = self.table.get(ctx) {
-                for (&lex, &cnt) in old {
-                    let e = merged.entry(lex).or_insert(0.0);
-                    *e += cnt;
-                }
+            } else if let Some(old) = self.table.get(&k) {
+                merged.merge(old, 1.0);
             }
-            let sum: f32 = merged.values().sum();
+            let sum = merged.total();
             return Some((merged, sum));
         }
 
@@ -165,8 +163,8 @@ impl HyperCube {
             }
         }
 
-        self.table.get(ctx).map(|c| {
-            let sum = self.totals.get(ctx).copied().unwrap_or_else(|| c.values().sum());
+        self.table.get(&k).map(|c| {
+            let sum = self.totals.get(&k).copied().unwrap_or_else(|| c.total());
             (c.clone(), sum)
         })
     }
@@ -198,12 +196,13 @@ impl HyperCube {
             let max_n = self.order.min(i);
             for n in 0..max_n {
                 let ctx = &ctx_cache[i][n];
+                let k = chave(ctx);
                 if self.spill_enabled {
-                    *self.pending.entry(ctx.clone()).or_default().entry(lex).or_insert(0.0) += 1.0;
-                    *self.pending_totals.entry(ctx.clone()).or_insert(0.0) += 1.0;
+                    self.pending.entry(k).or_default().add(lex, 1.0);
+                    *self.pending_totals.entry(k).or_insert(0.0) += 1.0;
                 } else {
-                    *self.table.entry(ctx.clone()).or_default().entry(lex).or_insert(0.0) += 1.0;
-                    *self.totals.entry(ctx.clone()).or_insert(0.0) += 1.0;
+                    self.table.entry(k).or_default().add(lex, 1.0);
+                    *self.totals.entry(k).or_insert(0.0) += 1.0;
                 }
             }
         }
@@ -241,7 +240,7 @@ impl HyperCube {
                 // probs=0 e deixaria os lambdas no valor inicial.
                 if let Some((cands, total)) = self.lookup_ctx(&ctx_cache[i][n]) {
                     let total = total.max(1.0);
-                    probs[n] = (cands.get(&lex).copied().unwrap_or(0.0) / total) as f64;
+                    probs[n] = (cands.get(lex).unwrap_or(0.0) / total) as f64;
                 }
             }
 
@@ -291,7 +290,7 @@ impl HyperCube {
             if let Some((cands, total)) = self.lookup_ctx(&ctx) {
                 if total > 0.0 {
                     let w = self.lambda.get(n - 1).copied().unwrap_or(0.1);
-                    for (&lx, &cnt) in &cands {
+                    for &(lx, cnt) in &cands.items {
                         *dist.entry(lx).or_insert(0.0) += w * cnt / total;
                     }
                 }
@@ -406,11 +405,12 @@ impl HyperCube {
                 // `reinforce` escreve. Shards são imutáveis em inferência, então
                 // no modo spill aplicamos o delta em `pending` e ele vai para o
                 // próximo flush — o shard já gravado não é reescrito.
+                let k = chave(&ctx);
                 if self.spill_enabled {
-                    *self.pending.entry(ctx.clone()).or_default().entry(t.lex).or_insert(0.0) += delta;
-                    *self.pending_totals.entry(ctx.clone()).or_insert(0.0) += delta;
-                } else if let Some(cands) = self.table.get_mut(&ctx) {
-                    if let Some(c) = cands.get_mut(&t.lex) {
+                    self.pending.entry(k).or_default().add(t.lex, delta);
+                    *self.pending_totals.entry(k).or_insert(0.0) += delta;
+                } else if let Some(cands) = self.table.get_mut(&k) {
+                    if let Some(c) = cands.get_mut(t.lex) {
                         *c = (*c + delta).max(0.01);
                     }
                 }
@@ -441,56 +441,48 @@ impl HyperCube {
         Self::load_unigram(&data, off, &mut self.unigram, &mut self.total_lex);
     }
 
-    fn save_map_lex(data: &mut Vec<u8>, map: &HashMap<Vec<u128>, HashMap<u32, f32>>, totals: &HashMap<Vec<u128>, f32>) {
+    fn save_map_lex(data: &mut Vec<u8>, map: &FxHashMap<CtxKey, Cands>, totals: &FxHashMap<CtxKey, f32>) {
         data.extend_from_slice(&(map.len() as u32).to_le_bytes());
         for (ctx, nexts) in map {
-            let ctx_len = ctx.len() as u32;
-            data.extend_from_slice(&ctx_len.to_le_bytes());
-            for &v in ctx { data.extend_from_slice(&v.to_le_bytes()); }
+            data.extend_from_slice(&ctx.to_le_bytes());
             data.extend_from_slice(&totals.get(ctx).copied().unwrap_or(0.0).to_le_bytes());
-            let n = nexts.len() as u32;
-            data.extend_from_slice(&n.to_le_bytes());
-            for (&k, &v) in nexts {
+            data.extend_from_slice(&(nexts.len() as u32).to_le_bytes());
+            for &(k, v) in &nexts.items {
                 data.extend_from_slice(&k.to_le_bytes());
                 data.extend_from_slice(&v.to_le_bytes());
             }
         }
     }
 
-    fn load_map_lex(data: &[u8], off: &mut usize, map: &mut HashMap<Vec<u128>, HashMap<u32, f32>>, totals: &mut HashMap<Vec<u128>, f32>) {
+    fn load_map_lex(data: &[u8], off: &mut usize, map: &mut FxHashMap<CtxKey, Cands>, totals: &mut FxHashMap<CtxKey, f32>) {
         let n = u32::from_le_bytes(data[*off..*off+4].try_into().unwrap()) as usize;
         *off += 4;
         for _ in 0..n {
-            let ctx_len = u32::from_le_bytes(data[*off..*off+4].try_into().unwrap()) as usize;
-            *off += 4;
-            let mut ctx = Vec::with_capacity(ctx_len);
-            for _ in 0..ctx_len {
-                let v = u128::from_le_bytes(data[*off..*off+16].try_into().unwrap());
-                *off += 16;
-                ctx.push(v);
-            }
+            let ctx: CtxKey = u64::from_le_bytes(data[*off..*off+8].try_into().unwrap());
+            *off += 8;
             let total = f32::from_le_bytes(data[*off..*off+4].try_into().unwrap());
             *off += 4;
             let n_next = u32::from_le_bytes(data[*off..*off+4].try_into().unwrap()) as usize;
             *off += 4;
-            let mut nexts = HashMap::with_capacity(n_next);
+            let mut items = Vec::with_capacity(n_next);
             for _ in 0..n_next {
                 let k = u32::from_le_bytes(data[*off..*off+4].try_into().unwrap()); *off += 4;
                 let v = f32::from_le_bytes(data[*off..*off+4].try_into().unwrap()); *off += 4;
-                nexts.insert(k, v);
+                items.push((k, v));
             }
-            totals.insert(ctx.clone(), total);
-            map.insert(ctx, nexts);
+            items.sort_unstable_by_key(|&(l, _)| l);
+            totals.insert(ctx, total);
+            map.insert(ctx, Cands { items });
         }
     }
 
-    fn save_unigram(data: &mut Vec<u8>, unigram: &HashMap<u32, f32>, total: f32) {
+    fn save_unigram(data: &mut Vec<u8>, unigram: &FxHashMap<u32, f32>, total: f32) {
         data.extend_from_slice(&(unigram.len() as u32).to_le_bytes());
         data.extend_from_slice(&total.to_le_bytes());
         for (&k, &v) in unigram { data.extend_from_slice(&k.to_le_bytes()); data.extend_from_slice(&v.to_le_bytes()); }
     }
 
-    fn load_unigram(data: &[u8], off: &mut usize, unigram: &mut HashMap<u32, f32>, total: &mut f32) {
+    fn load_unigram(data: &[u8], off: &mut usize, unigram: &mut FxHashMap<u32, f32>, total: &mut f32) {
         let n = u32::from_le_bytes(data[*off..*off+4].try_into().unwrap()) as usize;
         *off += 4;
         *total = f32::from_le_bytes(data[*off..*off+4].try_into().unwrap());

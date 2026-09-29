@@ -10,36 +10,35 @@
 //! inferência nunca reescreve (só `reinforce`, que é treino), a página só é
 //! lida uma vez e o kernel pode descartá-la sob pressão de memória.
 
-use std::collections::HashMap;
+use crate::amadeus_m::compact::{chave, Cands, CtxKey, FxHashMap};
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use memmap2::Mmap;
 
-/// Contexto serializado: seq de u128 + contagem total + candidatos.
-type Ctx = Vec<u128>;
+/// Chave canônica de contexto (u64). Ver `compact.rs`.
+type Ctx = CtxKey;
 
-/// Formato de um shard:
+/// Formato de um shard (v2):
 /// ```text
-/// magic   : [u8; 8]   "AMDSHRD1"
+/// magic   : [u8; 8]   "AMDSHRD2"
 /// n_ctx   : u32
 /// n_cands : u32         (total de candidatos no shard, para pré-alocar)
 /// total_lex: f32
 /// por contexto:
-///   ctx_len : u32
-///   ctx     : [u128; ctx_len]
+///   ctx     : u64        (chave canônica, sem comprimento)
 ///   sum     : f32
 ///   n_cand  : u32
-///   (lex    : u32, cnt : f32) * n_cand
+///   (lex    : u32, cnt : f32) * n_cand   (ordenado por lex)
 /// ```
-const MAGIC: &[u8; 8] = b"AMDSHRD1";
+const MAGIC: &[u8; 8] = b"AMDSHRD2";
 
 /// Estado de um único shard em disco, mapeado em memória.
 struct Shard {
     path: PathBuf,
     /// Contexto -> offset do registro dentro do arquivo. Só o índice fica em RAM.
-    index: HashMap<Ctx, u64>,
+    index: FxHashMap<Ctx, u64>,
     mmap: Option<Mmap>,
 }
 
@@ -60,34 +59,21 @@ impl Shard {
         let _total_lex = f32::from_le_bytes(data[16..20].try_into().unwrap());
 
         // Índice: lê os headers de cada contexto, sem materializar candidatos.
-        let mut index = HashMap::with_capacity(n_ctx);
+        let mut index = FxHashMap::default();
+        index.reserve(n_ctx);
         let mut off = 20usize;
         for _ in 0..n_ctx {
-            if off + 4 > data.len() {
+            if off + 16 > data.len() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
                     "shard truncado no indice",
                 ));
             }
-            // O offset guardado é o início do registro, ou seja, a posição do
-            // próprio ctx_len. Guardamos antes de avançar.
+            // v2: chave u64 fixa, sem comprimento. O offset guardado é o
+            // início do registro.
             let record_start = off;
-            let ctx_len = u32::from_le_bytes(data[off..off + 4].try_into().unwrap()) as usize;
-            off += 4;
-            if off + ctx_len * 16 > data.len() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "shard truncado no contexto",
-                ));
-            }
-            // `as_chunks` seria mais idiomático, mas continua unstable no
-            // toolchain atual (1.98), então o lint fica desligado aqui.
-            #[allow(clippy::chunks_exact_to_as_chunks)]
-            let ctx: Ctx = data[off..off + ctx_len * 16]
-                .chunks_exact(std::mem::size_of::<u128>())
-                .map(|c| u128::from_le_bytes(c.try_into().unwrap()))
-                .collect();
-            off += ctx_len * 16;
+            let ctx: Ctx = u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
+            off += 8;
             let _sum = f32::from_le_bytes(data[off..off + 4].try_into().unwrap());
             off += 4;
             let n_c = u32::from_le_bytes(data[off..off + 4].try_into().unwrap()) as usize;
@@ -104,9 +90,9 @@ impl Shard {
     /// Mapeia o arquivo se ainda não mapeado, e devolve os candidatos de um contexto.
     /// Retorna por valor: os candidatos são materializados num HashMap próprio,
     /// então não há referência válida a se devolver.
-    fn lookup(&mut self, ctx: &[u128]) -> Option<(HashMap<u32, f32>, f32)> {
-        // Offset guardado aponta para o inicio do registro (ctx_len).
-        let &start = self.index.get(ctx)?;
+    fn lookup(&mut self, ctx: Ctx) -> Option<(Cands, f32)> {
+        // Offset guardado aponta para o inicio do registro.
+        let &start = self.index.get(&ctx)?;
 
         if self.mmap.is_none() {
             let file = File::open(&self.path).ok()?;
@@ -117,32 +103,30 @@ impl Shard {
         }
         let m = self.mmap.as_ref().unwrap();
 
-        let mut off = start as usize;
-        let ctx_len = u32::from_le_bytes(m[off..off + 4].try_into().unwrap()) as usize;
-        off += 4 + ctx_len * 16;
+        let mut off = start as usize + 8; // pula a chave u64
         let sum = f32::from_le_bytes(m[off..off + 4].try_into().unwrap());
         off += 4;
         let n_c = u32::from_le_bytes(m[off..off + 4].try_into().unwrap()) as usize;
         off += 4;
 
-        // Materializa candidatos num HashMap próprio. Seria ideal evitar, mas a
-        // API de `sample_lex_modulated` itera candidatos; o custo é por acesso.
-        let mut cands = HashMap::with_capacity(n_c);
+        // Materializa candidatos. Já vêm ordenados por lex no arquivo, então é
+        // um push direto sem reordenar.
+        let mut items = Vec::with_capacity(n_c);
         for i in 0..n_c {
             let b = off + i * 8;
             let lex = u32::from_le_bytes(m[b..b + 4].try_into().unwrap());
             let cnt = f32::from_le_bytes(m[b + 4..b + 8].try_into().unwrap());
-            cands.insert(lex, cnt);
+            items.push((lex, cnt));
         }
-        Some((cands, sum))
+        Some((Cands { items }, sum))
     }
 }
 
 /// Escreve um shard com os contextos fornecidos.
 fn write_shard(
     path: &Path,
-    table: &HashMap<Ctx, HashMap<u32, f32>>,
-    totals: &HashMap<Ctx, f32>,
+    table: &FxHashMap<Ctx, Cands>,
+    totals: &FxHashMap<Ctx, f32>,
     total_lex: f32,
 ) -> std::io::Result<()> {
     let file = File::create(path)?;
@@ -155,13 +139,10 @@ fn write_shard(
     w.write_all(&total_lex.to_le_bytes())?;
 
     for (ctx, cands) in table {
-        w.write_all(&(ctx.len() as u32).to_le_bytes())?;
-        for &v in ctx {
-            w.write_all(&v.to_le_bytes())?;
-        }
+        w.write_all(&ctx.to_le_bytes())?;
         w.write_all(&totals.get(ctx).copied().unwrap_or(0.0).to_le_bytes())?;
         w.write_all(&(cands.len() as u32).to_le_bytes())?;
-        for (&lex, &cnt) in cands {
+        for &(lex, cnt) in &cands.items {
             w.write_all(&lex.to_le_bytes())?;
             w.write_all(&cnt.to_le_bytes())?;
         }
@@ -215,8 +196,8 @@ impl ShardStore {
     /// Descarrega um lote de contextos para um shard novo.
     pub fn flush(
         &mut self,
-        table: &HashMap<Ctx, HashMap<u32, f32>>,
-        totals: &HashMap<Ctx, f32>,
+        table: &FxHashMap<Ctx, Cands>,
+        totals: &FxHashMap<Ctx, f32>,
         total_lex: f32,
     ) -> std::io::Result<PathBuf> {
         let path = self.dir.join(format!("{:05}.cuboshard", self.shards.len()));
@@ -226,9 +207,10 @@ impl ShardStore {
     }
 
     /// Procura um contexto em todos os shards.
-    pub fn get(&mut self, ctx: &[u128]) -> Option<(HashMap<u32, f32>, f32)> {
+    pub fn get(&mut self, ctx: &[u128]) -> Option<(Cands, f32)> {
+        let k = chave(ctx);
         for shard in &mut self.shards {
-            if let Some(found) = shard.lookup(ctx) {
+            if let Some(found) = shard.lookup(k) {
                 return Some(found);
             }
         }

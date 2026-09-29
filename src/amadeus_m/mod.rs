@@ -41,3 +41,4 @@ pub use agnes::Agnes;
 pub use underworld::Underworld;
 pub use compiler::Compiler;
 pub mod shard;
+pub mod compact;

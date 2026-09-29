@@ -58,36 +58,49 @@ fn is_portuguese(text: &str) -> bool {
     if text.is_empty() { return false; }
 
     // Find safe boundary at char boundary
-    let sample_len = text.len().min(5000);
+    let sample_len = text.len().min(8000);
     let mut end = sample_len;
     while end > 0 && !text.is_char_boundary(end) {
         end -= 1;
     }
     let sample = &text[..end];
-
-    // Portuguese-specific chars and common words
-    let pt_chars = ['ã', 'õ', 'á', 'é', 'í', 'ó', 'ú', 'â', 'ê', 'ô', 'ç', 'à'];
-    let pt_words = [" de ", " que ", " e ", " a ", " o ", " os ", " as ", " um ", " uma ", " para ", " com ", " não ", " se ", " na ", " no ", " por ", " mas ", " foi ", " do ", " da ", " dos ", " das "];
-
-    let mut pt_char_count = 0;
-    let mut pt_word_count = 0;
-
-    for c in sample.chars() {
-        if pt_chars.contains(&c) {
-            pt_char_count += 1;
-        }
-    }
-
     let lower = sample.to_lowercase();
-    for word in &pt_words {
-        pt_word_count += lower.matches(word).count();
-    }
 
-    // Score: at least 2% Portuguese chars OR 10+ common words
-    let char_ratio = pt_char_count as f32 / sample_len.max(1) as f32;
-    let has_pt_words = pt_word_count >= 10;
+    // Palavras que não aparecem em inglês/francês/italiano/alemão no mesmo
+    // contexto. Este é o sinal mais forte: nos arquivos reais do corpus, textos
+    // portugueses ficam em 31-43 ocorrências e os foreigners em 0-11.
+    let pt_unicas = [
+        " não ", " uma ", " dos ", " das ", " pelo ", " pela ", " também ",
+        " então ", " depois ", " porque ", " quando ", " muito ", " era ", " ela ",
+    ];
+    let unic_count: usize = pt_unicas.iter().map(|w| lower.matches(w).count()).sum();
 
-    char_ratio > 0.02 || has_pt_words
+    // Stopwords comuns. Sozinhas não bastam: inglês, francês, italiano e
+    // espanhol usam "a", "o", "de", "que", "não".
+    let pt_words = [
+        " de ", " que ", " e ", " a ", " o ", " os ", " as ", " um ", " uma ",
+        " para ", " com ", " não ", " se ", " na ", " no ", " por ", " mas ",
+        " foi ", " do ", " da ", " dos ", " das ",
+    ];
+    let word_count: usize = pt_words.iter().map(|w| lower.matches(w).count()).sum();
+
+    // Acentos: complements, mas não obrigatório. Textos do Gutenberg antigos
+    // às vezes perdem acentuação, e "Memórias Póstumas de Braz Cubas" tem só 0.017.
+    let pt_chars = ['ã', 'õ', 'á', 'é', 'í', 'ó', 'ú', 'â', 'ê', 'ô', 'ç', 'à'];
+    let char_count = sample.chars().filter(|c| pt_chars.contains(c)).count();
+    let char_ratio = char_count as f32 / sample_len.max(1) as f32;
+
+    // Antes era `char_ratio > 0.02 || word_count >= 10`. O OU era o problema:
+    // texto em inglês/francês passava por ter as mesmas stopwords, e o corpus
+    // virava multilingual — a geração saía misturando "d'este allaient",
+    // "semble", "longer be general".
+    let tem_palabras_unicas = unic_count >= 20;
+    let tem_stopwords = word_count >= 10;
+    let tem_acentos = char_ratio > 0.0015;
+
+    // Palavras únicas bastam por si (é o separador mais limpo). Stopwords +
+    // acentos são o caminho para textos com pouca amostra.
+    tem_palabras_unicas || (tem_stopwords && tem_acentos)
 }
 
 /// Compilador simplificado que aprende vocabulário diretamente do texto
@@ -285,6 +298,22 @@ fn classify_style(word: &str, class: u8) -> u16 {
     0
 }
 
+/// Lê um inteiro de uma flag no formato `--nome N` ou `--nome=N`.
+/// Retorna `None` se a flag não existir.
+fn arg_usize(nome: &str) -> Option<usize> {
+    let args: Vec<String> = std::env::args().collect();
+    let prefix_eq = format!("{nome}=");
+    for (i, a) in args.iter().enumerate() {
+        if a == nome {
+            return args.get(i + 1).and_then(|v| v.parse().ok());
+        }
+        if let Some(v) = a.strip_prefix(&prefix_eq) {
+            return v.parse().ok();
+        }
+    }
+    None
+}
+
 fn main() {
     println!("╔══════════════════════════════════════════════════════════╗");
     println!("║  AMADEUS — TREINAMENTO MISTO (WIKIPÉDIA + NARRATIVO)  ║");
@@ -311,11 +340,15 @@ fn main() {
                     let file_name = path.file_stem()
                         .and_then(|s| s.to_str())
                         .unwrap_or("?");
-                    if content.len() > 100 && is_portuguese(&content) {
-                        println!("    → {} ({} KB)", file_name, content.len() / 1024);
-                        all_text.push_str(&content);
+                    // Remove o cabeçalho do Project Gutenberg ANTES do filtro de
+                    // idioma: o cabeçalho é em inglês e fazia o texto português
+                    // ser rejeitado.
+                    let cleaned = strip_gutenberg(&content);
+                    if cleaned.len() > 100 && is_portuguese(&cleaned) {
+                        println!("    → {} ({} KB)", file_name, cleaned.len() / 1024);
+                        all_text.push_str(&cleaned);
                         all_text.push('\n');
-                        wiki_chars += content.len();
+                        wiki_chars += cleaned.len();
                         file_count += 1;
                     }
                 }
@@ -334,6 +367,7 @@ fn main() {
                         .and_then(|s| s.to_str())
                         .unwrap_or("?");
                     if content.len() > 1000 {
+                        // Mesma ordem: strip antes do filtro de idioma.
                         let cleaned = strip_gutenberg(&content);
                         if cleaned.len() > 500 && is_portuguese(&cleaned) {
                             println!("    → {} ({} KB)", file_name, cleaned.len() / 1024);
@@ -371,15 +405,32 @@ fn main() {
 
     println!("  {} frases extraídas", sentences.len());
 
+    // Limite de tokens. A tabela de contextos do CUBO cresce ~quadraticamente
+    // com o corpus: 1,19M de tokens produz 7,67 milhões de contextos e ~3,6 GB
+    // de RAM ao carregar. Para experimento e teste de interação, 300k de tokens
+    // bastam e o modelo cabe folgado. `0` = sem limite.
+    let max_tokens: usize = arg_usize("--max-tokens").unwrap_or(300_000);
+    let mut budget = max_tokens;
+    let mut truncado = false;
+
     // Compilar cada frase
     let mut all_tokens: Vec<Token7> = Vec::new();
     for sentence in &sentences {
+        if budget == 0 {
+            truncado = true;
+            break;
+        }
         let tokens = compiler.compile(sentence);
         if tokens.len() >= 2 {
-            all_tokens.extend_from_slice(&tokens);
+            let take = tokens.len().min(budget);
+            all_tokens.extend_from_slice(&tokens[..take]);
+            budget -= take;
         }
     }
 
+    if truncado {
+        println!("  (limitado a {} tokens)", max_tokens);
+    }
     println!("  {} tokens compilados", all_tokens.len());
     println!();
 

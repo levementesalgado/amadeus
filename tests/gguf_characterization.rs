@@ -60,10 +60,11 @@ fn graph_tem_centena_de_mil_entradas() {
         .expect("graph.data");
 
     let numel: usize = graph.shape.iter().map(|&d| d as usize).product();
-    // Pares (lex_id, assinatura) de u32. 99301 GRAPH => ~198k u32.
+    // Pares (lex_id, assinatura) de u32. O tamanho depende do corpus: o modelo
+    // de 1,19M de tokens tem 99301 entradas, o de 300k tem ~75k.
     assert!(
-        numel >= 190_000,
-        "GRAPH pequena demais: {numel} elementos (esperado ~198k para 99301 entradas)"
+        numel >= 100_000,
+        "GRAPH pequena demais: {numel} elementos (esperado >=100k para o menor modelo)"
     );
     assert_eq!(numel % 2, 0, "GRAPH deve ter pares");
 }
@@ -78,7 +79,8 @@ fn lexicon_tem_ordem_de_mil_palavras() {
         .expect("lexicon.forms");
 
     let rows = lex.shape[0] as usize;
-    assert!(rows >= 1000, "léxico pequeno demais: {rows} formas (esperado 1379)");
+    // Varia com o corpus: 1379 no modelo pequeno, 75741 no de 300k tokens.
+    assert!(rows >= 1000, "léxico pequeno demais: {rows} formas (esperado >=1000)");
 }
 
 #[test]

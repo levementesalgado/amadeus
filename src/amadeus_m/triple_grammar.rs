@@ -5,6 +5,8 @@ use crate::amadeus_m::syntax::assign_dependencies;
 use crate::amadeus_m::hierarchical::HierarchicalCubo;
 
 const FORMAT_VERSION: u32 = 4;
+/// Versão do blob do CUBO. v2 = chave u64 canônico (antes v1 usava Vec<u128>).
+const CUBO_BLOB_VERSION: u32 = 2;
 
 pub struct TripleGrammar {
     pub syntax_order: usize,
@@ -2162,14 +2164,21 @@ impl TripleGrammar {
         buf
     }
 
+    /// Serializa o CUBO.
+    ///
+    /// Formato v2: a chave do contexto passou de `Vec<u128>` para `u64`
+    /// canônico (ver `compact.rs`), então o registro encolheu de
+    /// `ctx_len + n*16 + ...` para 8 bytes fixos. Isso corta o `cubo.clause.blob`
+    /// de 721 MB para pouco mais da metade.
     fn serialize_cubo_blob(cube: &crate::amadeus_m::hypercube::HyperCube) -> Vec<u8> {
         let mut buf = Vec::new();
+        buf.extend_from_slice(&CUBO_BLOB_VERSION.to_le_bytes());
         buf.extend_from_slice(&(cube.table.len() as u32).to_le_bytes());
         for (ctx, nexts) in &cube.table {
-            buf.extend_from_slice(&(ctx.len() as u32).to_le_bytes());
-            for &v in ctx { buf.extend_from_slice(&v.to_le_bytes()); }
+            buf.extend_from_slice(&ctx.to_le_bytes());
+            buf.extend_from_slice(&nexts.total().to_le_bytes());
             buf.extend_from_slice(&(nexts.len() as u32).to_le_bytes());
-            for (&k, &v) in nexts {
+            for &(k, v) in &nexts.items {
                 buf.extend_from_slice(&k.to_le_bytes());
                 buf.extend_from_slice(&v.to_le_bytes());
             }
@@ -2186,46 +2195,49 @@ impl TripleGrammar {
     }
 
     fn read_cubo_blob(raw: &[u8], cube: &mut crate::amadeus_m::hypercube::HyperCube) {
+        use crate::amadeus_m::compact::Cands;
         let mut off = 0;
         cube.table.clear();
         cube.totals.clear();
         cube.unigram.clear();
         cube.total_lex = 0.0;
 
-        if raw.len() < 4 { return; }
+        if raw.len() < 8 { return; }
 
-        // Read n_contexts
+        // Versão do formato. v1 usava `Vec<u128>` como chave; v2 usa `u64`.
+        let version = u32::from_le_bytes(raw[0..4].try_into().unwrap());
+        if version != CUBO_BLOB_VERSION {
+            eprintln!(
+                "  WARN: cubo blob v{version} incompatível com v{CUBO_BLOB_VERSION} — \
+                 regenere o modelo (cargo run --bin train_wikipedia)"
+            );
+            return;
+        }
+        off = 4;
+
         let n_contexts = u32::from_le_bytes(raw[off..off+4].try_into().unwrap()) as usize;
         off += 4;
 
-        // Read context entries
-        let order = cube.order;
         for _ in 0..n_contexts {
-            if off + 4 > raw.len() { break; }
-            let ctx_len = u32::from_le_bytes(raw[off..off+4].try_into().unwrap()) as usize;
+            if off + 16 > raw.len() { break; }
+            // v2: chave u64 fixa, sem comprimento.
+            let ctx = u64::from_le_bytes(raw[off..off+8].try_into().unwrap());
+            off += 8;
+            let sum = f32::from_le_bytes(raw[off..off+4].try_into().unwrap());
             off += 4;
-            if ctx_len > order + 1 || ctx_len == 0 { break; }
-            if off + ctx_len * 16 > raw.len() { break; }
-            let mut ctx = Vec::with_capacity(ctx_len);
-            for _ in 0..ctx_len {
-                let v = u128::from_le_bytes(raw[off..off+16].try_into().unwrap());
-                off += 16;
-                ctx.push(v);
-            }
             if off + 4 > raw.len() { break; }
             let n_next = u32::from_le_bytes(raw[off..off+4].try_into().unwrap()) as usize;
             off += 4;
             if off + n_next * 8 > raw.len() { break; }
-            let mut nexts = HashMap::with_capacity(n_next);
-            let mut sum = 0.0f32;
+            let mut cands: Vec<(u32, f32)> = Vec::with_capacity(n_next);
             for _ in 0..n_next {
                 let k = u32::from_le_bytes(raw[off..off+4].try_into().unwrap()); off += 4;
                 let v = f32::from_le_bytes(raw[off..off+4].try_into().unwrap()); off += 4;
-                sum += v;
-                nexts.insert(k, v);
+                cands.push((k, v));
             }
-            cube.totals.insert(ctx.clone(), sum);
-            cube.table.insert(ctx, nexts);
+            cands.sort_unstable_by_key(|&(l, _)| l);
+            cube.totals.insert(ctx, sum);
+            cube.table.insert(ctx, Cands { items: cands });
         }
 
         // Read unigram section

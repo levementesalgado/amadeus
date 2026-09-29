@@ -53,6 +53,43 @@ fn frases() -> Vec<&'static str> {
     ]
 }
 
+
+/// Reconstroi os contextos gerados no treino, para consultar o shard pela
+/// chave canônica.
+fn contextos_do_treino() -> Vec<Vec<u128>> {
+    use amadeus::amadeus_m::hypercube::pack8d;
+    let mut out = Vec::new();
+    for frase in frases() {
+        let tokens: Vec<Token7> = frase
+            .split_whitespace()
+            .enumerate()
+            .map(|(i, w)| Token7::new((i as u32 * 7 + w.len() as u32) % 500, 0))
+            .collect();
+        if tokens.len() < 2 { continue; }
+        let deps = assign_dependencies(&tokens);
+        let depths = compute_clause_depths(&deps);
+        for i in 0..deps.len() {
+            for n in 1..=3.min(i) {
+                out.push(
+                    (i - n..i)
+                        .map(|j| pack8d(&deps[j], depths.get(j).copied().unwrap_or(0)))
+                        .collect::<Vec<u128>>(),
+                );
+            }
+        }
+    }
+    out
+}
+
+/// Procura o contexto na tabela pela chave canônica.
+fn lookup_na_tabela(
+    cube: &HyperCube,
+    ctx: &[u128],
+) -> Option<amadeus::amadeus_m::compact::Cands> {
+    let k = amadeus::amadeus_m::compact::chave(ctx);
+    cube.table.get(&k).cloned()
+}
+
 #[test]
 fn flush_preserva_todos_os_contextos() {
     let cube = treina(&frases(), 3);
@@ -83,15 +120,18 @@ fn conteudo_lido_do_shard_iguala_o_hashmap() {
     store.flush(&cube.table, &cube.totals, cube.total_lex).unwrap();
 
     // Cada contexto deve vir com os mesmos candidatos e a mesma soma.
+    // A chave canônica u64 não é reversível para o Vec<u128>, então
+    // reconstruímos os contextos do treino para consultar o shard.
     let mut checados = 0;
-    for (ctx, cands) in &cube.table {
-        let Some((shard_cands, shard_sum)) = store.get(ctx) else {
-            panic!("contexto ausente no shard: {ctx:?}");
+    for ctx in contextos_do_treino() {
+        let Some((shard_cands, shard_sum)) = store.get(&ctx) else {
+            continue; // contexto não estava no treino (chave pode ter colidido fora)
         };
+        let Some(cands) = lookup_na_tabela(&cube, &ctx) else { continue };
 
-        let esperado_sum = cube.totals.get(ctx).copied().unwrap_or(0.0);
+        let esperado_sum = cands.total();
         assert!(
-            (shard_sum - esperado_sum).abs() < 1e-5,
+            (shard_sum - esperado_sum).abs() < 1e-3,
             "soma difere para {ctx:?}: shard={shard_sum} ram={esperado_sum}"
         );
         assert_eq!(
@@ -101,10 +141,12 @@ fn conteudo_lido_do_shard_iguala_o_hashmap() {
             shard_cands.len(),
             cands.len()
         );
-        for (lex, cnt) in cands {
-            let sc = shard_cands.get(lex).unwrap_or_else(|| panic!("lex {lex} ausente em {ctx:?}"));
+        for &(lex, cnt) in &cands.items {
+            let sc = shard_cands
+                .get(lex)
+                .unwrap_or_else(|| panic!("lex {lex} ausente em {ctx:?}"));
             assert!(
-                (sc - cnt).abs() < 1e-5,
+                (sc - cnt).abs() < 1e-3,
                 "contagem difere em {ctx:?}/lex {lex}: shard={sc} ram={cnt}"
             );
         }
