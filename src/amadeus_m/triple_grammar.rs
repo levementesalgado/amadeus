@@ -56,6 +56,10 @@ pub struct TripleGrammar {
     pub topic_momentum: f32,
     pub recent_graphs: Vec<u32>,
     pub cohesion_alpha: f32,
+    /// Forma de superfície de cada lexema, indexada por id. Sem isso o modelo
+    /// é indecodificável: o GGUF guardava só os campos numéricos e a
+    /// palavra associated a cada id se perdia no save.
+    pub lex_forms: Vec<String>,
 }
 
 impl TripleGrammar {
@@ -96,6 +100,7 @@ impl TripleGrammar {
             topic_momentum: 0.8,
             recent_graphs: Vec::new(),
             cohesion_alpha: 0.4,
+            lex_forms: Vec::new(),
         }
     }
 
@@ -1692,7 +1697,20 @@ impl TripleGrammar {
 
         // Lexicon
         let mut lex_data = Vec::new();
-        for (_form, &(id, morph, cls, sty)) in compiler_lexicon {
+        // Formas em ordem de id, separadas por \n. Sem isto o tensor
+        // `lexicon.forms` só carregava campos numéricos e o modelo salvo não
+        // podia ser decodificado: não havia forma de saber qual palavra
+        // corresponde a cada lexema.
+        let mut forms: Vec<String> = Vec::new();
+        for &(id, _, _, _) in compiler_lexicon.values() {
+            if forms.len() <= id as usize {
+                forms.resize(id as usize + 1, String::new());
+            }
+        }
+        for (form, &(id, _, _, _)) in compiler_lexicon {
+            forms[id as usize] = form.clone();
+        }
+        for (form, &(id, morph, cls, sty)) in compiler_lexicon {
             lex_data.extend_from_slice(&id.to_le_bytes());
             lex_data.extend_from_slice(&morph.to_le_bytes());
             lex_data.extend_from_slice(&(cls as u32).to_le_bytes());
@@ -1838,6 +1856,7 @@ impl TripleGrammar {
             GgufKv { key: "amadeus.temperature".into(), value: GgufValue::F32(self.temperature) },
             GgufKv { key: "amadeus.exploration_rate".into(), value: GgufValue::F32(self.exploration_rate) },
             GgufKv { key: "amadeus.graph_alpha".into(), value: GgufValue::F32(self.graph_alpha) },
+            GgufKv { key: "amadeus.lexicon.forms".into(), value: GgufValue::String(forms.join("\n")) },
         ];
 
         // ─── 4. Write header + data (no alignment padding in data) ───
@@ -1887,6 +1906,15 @@ impl TripleGrammar {
         if let Some(v) = get_f32("amadeus.temperature") { self.temperature = v; }
         if let Some(v) = get_f32("amadeus.exploration_rate") { self.exploration_rate = v; }
         if let Some(v) = get_f32("amadeus.graph_alpha") { self.graph_alpha = v; }
+
+        // Formas de superfície por lexema. Sem isso o modelo carrega mas não
+        // pode ser lido: qualquer decodificação seria por ids adivinhados.
+        self.lex_forms = header.kv_pairs
+            .iter()
+            .find(|kv| kv.key == "amadeus.lexicon.forms")
+            .and_then(|kv| if let GgufValue::String(s) = &kv.value { Some(s.clone()) } else { None })
+            .map(|s| s.split('\n').map(|x| x.to_string()).collect())
+            .unwrap_or_default();
 
         // Build tensor name → info map
         let tensor_map: std::collections::HashMap<&str, &crate::quant::gguf::GgufTensorInfo> = header

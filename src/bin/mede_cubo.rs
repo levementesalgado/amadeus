@@ -62,7 +62,7 @@ fn main() {
     }
 
     // Semente realista, via compilador mínimo.
-    let mut comp = Comp::new();
+    let comp = Comp::do_grafo(&g);
     let sementes = [
         "o Brasil é um país grande",
         "a música brasileira tem",
@@ -88,7 +88,7 @@ fn main() {
         total_pedidos += alvo;
         total_saida += novos;
         if novos < alvo { truncou += 1; }
-        println!("{:<32} {:>7}  {}", s, novos, comp.decompile(&saida));
+        println!("{:<32} {:>7}  {}", s, novos, comp.decompile(&g, &saida));
     }
 
     let trunc_str = format!("{}/{}", truncou, sementes.len());
@@ -121,45 +121,38 @@ fn main() {
     eprintln!("rss final: {} MB", rss_mb());
 }
 
-struct Comp { lexicon: HashMapV, roots: Vec<String> }
-type HashMapV = std::collections::HashMap<String, (u32, u16, u8, u16)>;
+/// Compilador sobre o léxico persistido no GGUF.
+///
+/// A versão anterior montava os ids por ordem de aparição no prompt, o que
+/// produzia ids sem relação com os do treino: o modelo recebia contextos
+/// errados e a saída era indecodificável. Agora os ids vêm das formas reais.
+struct Comp { forma_para_id: HashMapV }
+type HashMapV = std::collections::HashMap<String, u32>;
 impl Comp {
-    fn new() -> Self {
-        let mut c = Self { lexicon: HashMapV::new(), roots: vec![String::new()] };
-        for p in &[",", ".", "!", "?", ";", ":", "—", "-"] {
-            c.lexicon.insert(p.to_string(), (0, 6u16, 6, 0));
+    fn do_grafo(g: &TripleGrammar) -> Self {
+        let mut forma_para_id = HashMapV::new();
+        for (id, forma) in g.lex_forms.iter().enumerate() {
+            if !forma.is_empty() {
+                forma_para_id.entry(forma.to_lowercase()).or_insert(id as u32);
+            }
         }
-        c
+        Self { forma_para_id }
     }
-    fn compile(&mut self, text: &str) -> Vec<Token7> {
+    fn compile(&self, text: &str) -> Vec<Token7> {
         let mut tokens = Vec::new();
         for w in text.split(|c: char| c.is_whitespace() || ",.!?;:".contains(c)) {
             let w = w.trim();
             if w.is_empty() { continue; }
-            if let Some(&(id, morph, _, style)) = self.lexicon.get(w) {
-                tokens.push(Token7::new(id, morph).with_style(style)); continue;
+            if let Some(&id) = self.forma_para_id.get(&w.to_lowercase()) {
+                tokens.push(Token7::new(id, 0));
             }
-            let lower = w.to_lowercase();
-            if let Some(&(id, morph, _, style)) = self.lexicon.get(&lower) {
-                tokens.push(Token7::new(id, morph).with_style(style)); continue;
-            }
-            let id = self.roots.len() as u32;
-            self.roots.push(lower.clone());
-            let (class, morph) = if lower.ends_with("mente") { (4, 4u16) }
-                else if lower.ends_with("ar") || lower.ends_with("er") || lower.ends_with("ir") { (1, 1u16) }
-                else if lower == "o" || lower == "a" { (3, 3u16) }
-                else if lower == "de" || lower == "do" || lower == "da" { (5, 5u16) }
-                else { (0, 0u16) };
-            let style = (id as u16).wrapping_mul(0x9E37) & 0x3F;
-            self.lexicon.insert(lower, (id, morph | class as u16, class, style));
-            tokens.push(Token7::new(id, morph | class as u16).with_style(style));
         }
         tokens
     }
-    fn decompile(&self, tokens: &[Token7]) -> String {
-        let rev: std::collections::HashMap<u32, &str> =
-            self.lexicon.iter().map(|(w, &(id, _, _, _))| (id, w.as_str())).collect();
-        tokens.iter().map(|t| if t.lex == 0 { "." } else { rev.get(&t.lex).copied().unwrap_or("?") })
-            .collect::<Vec<_>>().join(" ")
+    fn decompile(&self, g: &TripleGrammar, tokens: &[Token7]) -> String {
+        tokens.iter().map(|t| {
+            if t.lex == 0 { ".".to_string() }
+            else { g.lex_forms.get(t.lex as usize).cloned().unwrap_or_else(|| "?".into()) }
+        }).collect::<Vec<_>>().join(" ")
     }
 }

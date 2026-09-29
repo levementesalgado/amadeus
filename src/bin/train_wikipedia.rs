@@ -75,32 +75,54 @@ fn is_portuguese(text: &str) -> bool {
     ];
     let unic_count: usize = pt_unicas.iter().map(|w| lower.matches(w).count()).sum();
 
-    // Stopwords comuns. Sozinhas não bastam: inglês, francês, italiano e
-    // espanhol usam "a", "o", "de", "que", "não".
-    let pt_words = [
-        " de ", " que ", " e ", " a ", " o ", " os ", " as ", " um ", " uma ",
-        " para ", " com ", " não ", " se ", " na ", " no ", " por ", " mas ",
-        " foi ", " do ", " da ", " dos ", " das ",
-    ];
-    let word_count: usize = pt_words.iter().map(|w| lower.matches(w).count()).sum();
+    // Stopwords não separam nada: PT, FR, IT e EN compartilham "a", "o",
+    // "de", "que". O que separa são palavras que NÃO existem em PT.
+    const FR: &[&str] = &[" le ", " la ", " les ", " des ", " est ", " une ",
+        " dans ", " que ", " pour ", " qui ", " sur ", " avec ", " pas ", " plus ",
+        " son ", " ses ", " cette ", " elle ", " nous ", " vous ", " mais ",
+        " tout ", " bien ", " aux ", " ont ", " ete ", " tres "];
+    const IT: &[&str] = &[" il ", " lo ", " gli ", " di ", " che ", " per ",
+        " non ", " una ", " con ", " sono ", " questo ", " della ", " nel ",
+        " alla ", " si ", " ma ", " come ", " piu ", " anche ", " degli ",
+        " essere "];
+    const EN: &[&str] = &[" the ", " of ", " and ", " to ", " in ", " is ",
+        " that ", " it ", " for ", " with ", " as ", " was ", " on ", " be ",
+        " at ", " by ", " this ", " have ", " from ", " or ", " an ", " they ",
+        " which "];
 
-    // Acentos: complements, mas não obrigatório. Textos do Gutenberg antigos
-    // às vezes perdem acentuação, e "Memórias Póstumas de Braz Cubas" tem só 0.017.
+    let n: f32 = sample.split_whitespace().count().max(1) as f32;
+    let pct = |arr: &[&str]| -> f32 {
+        arr.iter().map(|w| lower.matches(w).count()).sum::<usize>() as f32 / n
+    };
+    let fr_pct = pct(FR);
+    let it_pct = pct(IT);
+    let en_pct = pct(EN);
+    let pt_pct = pct(&[" de ", " que ", " e ", " a ", " o ", " os ", " as ",
+        " um ", " uma ", " para ", " com ", " não ", " se ", " na ", " no ",
+        " por ", " mas ", " foi ", " do ", " da ", " dos ", " das "]);
+
     let pt_chars = ['ã', 'õ', 'á', 'é', 'í', 'ó', 'ú', 'â', 'ê', 'ô', 'ç', 'à'];
     let char_count = sample.chars().filter(|c| pt_chars.contains(c)).count();
     let char_ratio = char_count as f32 / sample_len.max(1) as f32;
 
-    // Antes era `char_ratio > 0.02 || word_count >= 10`. O OU era o problema:
-    // texto em inglês/francês passava por ter as mesmas stopwords, e o corpus
-    // virava multilingual — a geração saía misturando "d'este allaient",
-    // "semble", "longer be general".
-    let tem_palabras_unicas = unic_count >= 20;
-    let tem_stopwords = word_count >= 10;
+    // O bug anterior: `word_count >= 10` era verdadeiro para qualquer texto
+    // com mais de 10 palavras, e todo idioma tem acentos. O OU então dava
+    // `true` sempre, e o filtro aceitava os 21 arquivos — 9 em inglês,
+    // 2 em francês, 1 em italiano. Por isso o modelo gerava jabuticaba.
+    let tem_palavras_unicas = unic_count >= 20;
     let tem_acentos = char_ratio > 0.0015;
 
-    // Palavras únicas bastam por si (é o separador mais limpo). Stopwords +
-    // acentos são o caminho para textos com pouca amostra.
-    tem_palabras_unicas || (tem_stopwords && tem_acentos)
+    // Estrangeiro relevante reprova sempre. Estes textos genuinamente PT
+    // (Dom Casmurro, Iaciara) têm marcadores compartilhados com FR/EN por
+    // causa das palavras comuns — daí a necessidade de checar `unic_count`
+    // forte junto. Francês/italiano do corpus (Le musée du Louvre, Dalla
+    // rupe) têm unic=0-6 e por isso caem aqui.
+    let estrangeiro_forte = fr_pct > 0.03 || it_pct > 0.03 || en_pct > 0.05;
+
+    if estrangeiro_forte && unic_count < 20 {
+        return false;
+    }
+    tem_palavras_unicas || (tem_acentos && pt_pct > 0.02)
 }
 
 /// Compilador simplificado que aprende vocabulário diretamente do texto
