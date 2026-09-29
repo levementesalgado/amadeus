@@ -7,22 +7,15 @@ Comandos usados para produzir cada número estão indicados.
 
 ---
 
-## 1. Dois caminhos de execução
+## 1. O caminho de execução
 
-O projeto tem **duas implementações de inferência**, e elas não conversam entre
-si. Isso é a confusão principal de quem chega ao repositório.
-
-| Caminho | Binário | Estado |
-|---------|---------|--------|
-| Pipeline de gramática | `src/bin/benchmark_wikipedia.rs` | **Funciona.** Gera português |
-| Transformer | `src/bin/amadeus_m.rs` | Esqueleto. Pesos aleatórios |
-
-### Pipeline de gramática (o que funciona)
-
-Carrega `training/wikipedia_grammar.bin` e gera texto:
+O projeto tem **um** caminho de inferência que funciona: o pipeline de gramática
+tabular (CUBO + T2/T3 + SNN). Ele opera sobre `Token7` — 8 campos inteiros — e
+não é uma rede neural.
 
 ```bash
-cargo run --release --bin benchmark_wikipedia
+cargo run --release --bin train_wikipedia      # gera o modelo
+cargo run --release --bin benchmark_wikipedia  # avalia
 ```
 
 ```
@@ -35,30 +28,33 @@ cargo run --release --bin benchmark_wikipedia
     SNN:     o brasil é um país
 ```
 
-O `.bin` **não carrega o CUBO**, e é por isso que esse binário roda sem
-consumo excessivo de memória.
+### O que foi removido em 2026-09-28
 
-### Transformer (esqueleto)
+Havia um segundo caminho, um transformer decoder, com dois binários próprios
+(`amadeus_m` e `amadeus_m_train`). Foram apagados junto com mais cinco
+demonstrações. Motivo: não funcionavam e não eram usados.
 
-```bash
-cargo run --release --bin amadeus_m
-```
+O `amadeus_m` rodava com pesos **aleatórios** — `AmadeusMModel::new(cfg)` cria
+pesos novos, e o modelo treinado de 795 MB nunca era carregado. A saída era
+`//////////r[231]`:
 
 ```
 Generating 20 tokens...
 //////////r[231]/r[231]/r[231]/r
 ```
 
-A saída é um loop degenerado. Duas causas somadas:
+O `amadeus_m_train` tinha interface de REPL (`Você>`, comandos `/porque`,
+`/ast`, `temp`) mas **não conversava**: cada turno chamava `grammar.train()`
+antes de responder, o léxico tinha 17 entradas, e o corpus de raízes estava
+vazio. A forma era de conversa; o conteúdo, um playground de gramática treinado
+ao vivo.
 
-1. `src/bin/amadeus_m.rs:27` chama `AmadeusMModel::new(cfg)`, que cria pesos
-   **aleatórios**. O modelo treinado de 795 MB não é carregado.
-2. `src/main.rs:50` faz `prompt.bytes()` como tokens, com o comentário
-   `// In a real impl: let tokens = tokenizer.encode(&prompt)`.
+Sobrou o código de transformer em `src/model/`, `src/layers/`,
+`src/sampler/`, `src/tokenizer/`, `src/quant/` e `src/main.rs`, sem binário que
+o exercite. Ver a seção 6.
 
-Existe um loader pronto (`src/amadeus_m/dual_loader.rs`, com `read_tensor_f32`
-e `list_tensors`) e um modelo treinado
-(`training/wikipedia_grammar.gguf`), mas nada conecta os dois.
+O `.bin` que o `benchmark_wikipedia` carrega **não inclui o CUBO**, e é por isso
+que esse caminho roda sem consumo excessivo de memória.
 
 ---
 
@@ -164,24 +160,29 @@ ganho de mais valor do trabalho, e é independente do sharding.
 
 ## 5. Como rodar cada coisa
 
-### Binário de conversa / REPL
+Os seis binários que restaram:
 
-**Path: `src/bin/amadeus_m_train.rs`**
+| Binário | Função |
+|---------|--------|
+| `train_wikipedia` | Treina o modelo a partir do corpus Wikipédia (813 linhas, ~30s) |
+| `benchmark_wikipedia` | Avalia: gera texto, mede qualidade e tempo |
+| `train_iterative` | Treino iterativo de morfologia |
+| `test_compiler` | Inspeção: decompõe uma frase em `Token7` (ID, morph hex, classe) |
+| `ollama_ls` | Lista modelos `.gguf` do Ollama com tamanho e quantização |
+| `agnes_train` | Pedagoga com LLM externo (requer API key) |
 
 ```bash
-cargo run --release --bin amadeus_m_train          # REPL interativo
-cargo run --release --bin amadeus_m_train --say="o gato"
-cargo run --release --bin amadeus_m_train --train-morphology --iterations 5 --order 3
+RUSTFLAGS="-C target-cpu=native" cargo build --release
+
+cargo run --release --bin train_wikipedia
+cargo run --release --bin benchmark_wikipedia
+cargo run --release --bin train_iterative
+cargo run --release --bin test_compiler
+cargo run --release --bin ollama_ls
 ```
 
-Comandos do REPL: `temp`, `order`, `explore`, `maxlen`, `status`, `/porque`,
-`/ast`, `sair`.
-
-> O `README.md` aponta estes comandos para `--bin amadeus_m`. Está errado: os
-> flags e o REPL estão em `amadeus_m_train`. `amadeus_m` não aceita nenhum
-> deles.
-
-Saída real do REPL hoje:
+Não há modo de conversa. O REPL que existia foi removido porque treinava com
+cada frase recebida antes de responder, e o corpus de raízes estava vazio:
 
 ```
 ─── Episódio 1 ───
@@ -189,20 +190,14 @@ Saída real do REPL hoje:
   Amadeus: gato gato gato gato porque gato porque gato gato gato gato ...
 ```
 
-Repetição forte. Causa: `amadeus.grammar7` tem 448 bytes e léxico de 17
-entradas (é um checkpoint de teste, não o modelo de 7,67M contextos).
-
-### Benchmark com o modelo real
+### Testes
 
 ```bash
-cargo run --release --bin benchmark_wikipedia
-```
-
-### Inspeção do GGUF
-
-```bash
-# 5 testes de caracterização do formato
+# 5 testes de caracterização do formato do artefato real
 cargo test --test gguf_characterization --release
+
+# 4 testes de round-trip do GGUF (save → load)
+cargo test --test gguf_roundtrip --release
 
 # 7 testes de paridade do shard
 cargo test --test shard_parity --release
@@ -220,16 +215,24 @@ cargo test --test grammar_load --release -- --test-threads=1
 
 | Lacuna | Impacto | Onde |
 |--------|---------|------|
-| `amadeus_m` não carrega o modelo | Binário transformer inútil | `src/bin/amadeus_m.rs:27` |
-| `main.rs` não tokeniza prompt | Prompt ignorado | `src/main.rs:50` |
-| `grammar7` é checkpoint de teste | REPL repete tokens | `amadeus.grammar7` (448 B) |
-| README aponta binário errado | Comandos falham | `README.md:100-106` |
-| Corpus Underworld vazio | Compilador sem raízes | `training/empty_underworld/lingua/raizes/` |
-| 9 docs de arquitetura, 3 sobrepostos | Risco de ler o errado | `ARCHITECTURE_HYBRID.md` (jul), `PHILOSOPHICAL_STACK.md` (mai) |
+| Código de transformer órfão | 1.332 linhas sem binário que as exercite | `src/model/`, `src/layers/`, `src/sampler/`, `src/tokenizer/`, `src/quant/`, `src/main.rs` |
+| `main.rs` não tokeniza prompt | Prompt virado byte cru | `src/main.rs:50` |
+| `grammar7` é checkpoint de teste | 448 B, léxico de 17 entradas | `amadeus.grammar7` |
+| Corpus Underworld vazio | Compilador sem raízes para `--train-morphology` | `training/empty_underworld/lingua/raizes/` |
+| 9 docs de arquitetura, 2 sobrepostos | Risco de ler o errado | `ARCHITECTURE_HYBRID.md` (jul), `PHILOSOPHICAL_STACK.md` (mai) |
 
 Vigente: `ARCHITECTURE.md` (v6.3, 16/set). `ARCHITECTURE_SNN.md` (14/set) e
 `AMADEUS.md` (14/set) são complementares. `ARCHITECTURE_HYBRID.md` (jul) e
-`PHILOSOPHICAL_STACK.md` (mai) estão superados e não têm marcação de obsolescência.
+`PHILOSOPHICAL_STACK.md` (mai) estão superados — os dois já carregam aviso no
+topo apontando para este documento.
+
+### Binários removidos
+
+Sete binários foram apagados em 2026-09-28. Cinco eram demonstrações
+(`test_pipeline`, `test_generate`, `test_snn`, `test_hybrid`, `test_gguf`) e dois
+eram o caminho transformer (`amadeus_m`, `amadeus_m_train`). O `test_gguf` foi
+convertido em `tests/gguf_roundtrip.rs` antes de sair, porque validava o
+round-trip do GGUF que nenhum outro teste cobria.
 
 ---
 
@@ -238,13 +241,18 @@ Vigente: `ARCHITECTURE.md` (v6.3, 16/set). `ARCHITECTURE_SNN.md` (14/set) e
 Antes desta sessão: 7 `#[test]` em 63 arquivos, concentrados em `self_play`,
 `morph_vocab` e `rhetoric`. Nenhum verificava geração.
 
-Adicionados 15:
+Adicionados 19:
 
 | Arquivo | Testes | Verifica |
 |---------|--------|----------|
 | `gguf_characterization.rs` | 5 | Formato, tensores e dimensões do artefato real |
+| `gguf_roundtrip.rs` | 4 | Save → load campo a campo; GGUF e .bin com o mesmo conteúdo |
 | `shard_parity.rs` | 7 | Conteúdo lido do shard == HashMap, cascade, corrompido |
 | `shard_generation.rs` | 3 | Geração idêntica RAM vs sharded, auto-flush |
+
+O `gguf_roundtrip` veio do binário `test_gguf`, que treinava com PCFG sintético,
+salvava, recarregava e comparava 20 campos imprimindo um contador de erros. Como
+teste, a mesma verificação quebra o build. Roda em 0,18s contra ~30s do binário.
 
 `grammar_load.rs` foi reescrito: o teste anterior carregava dois modelos de
 795 MB simultâneos e era morto por OOM. Agora carrega um e gera a partir dele.

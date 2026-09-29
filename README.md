@@ -7,21 +7,16 @@
 
 Amadeus é um motor de inferência **100% Rust**, CPU-only, que carrega modelos GGUF reais **e** implementa uma gramática tabular experimental sobre sequências morfológicas — o **AMADEUS-M**.
 
-> **Antes de usar: leia [ESTADO_REAL.md](ESTADO_REAL.md).** O projeto tem dois caminhos
-> de execução e só um funciona. O binário `amadeus_m` (transformer) roda com pesos
-> aleatórios; o pipeline de gramática (`benchmark_wikipedia`, REPL
-> `amadeus_m_train`) é o que gera português. O documento traz as medições, os
+> **Antes de usar: leia [ESTADO_REAL.md](ESTADO_REAL.md).** O caminho de
+> execução que funciona é o pipeline de gramática: `train_wikipedia` gera o
+> modelo e `benchmark_wikipedia` o avalia. O documento traz as medições, os
 > custos de memória e as lacunas conhecidas.
 
 ---
 
 ## Duas Almas
 
-### Amadeus (clássico) — `cargo run --release -- modelo.gguf`
-
-Carrega modelos GGUF (Ollama, llama.cpp) com quantização e transformer decoder padrão.
-
-### AMADEUS-M (morfológico) — `cargo run --release --bin amadeus_m`
+### AMADEUS-M (morfológico) — `cargo run --release --bin train_wikipedia`
 
 Opera exclusivamente sobre números. Nenhum texto entra no modelo. O **Compilador Morfológico** traduz texto ↔ `Token7` (8 campos inteiros) e o modelo aprende padrões nessas sequências numéricas. Não é uma rede neural. Não usa retropropagação.
 
@@ -103,23 +98,33 @@ Treinamento ──────┼─ Underworld (~73K tokens de 208 arquivos .md
 # Compilação otimizada
 RUSTFLAGS="-C target-cpu=native" cargo build --release
 
-# REPL de conversa (interativo)
-cargo run --release --bin amadeus_m_train
+# Treina o modelo a partir do corpus Wikipédia
+cargo run --release --bin train_wikipedia
 
-# Treino de morfologia
-cargo run --release --bin amadeus_m_train -- --train-morphology --iterations 5 --order 3
-
-# Comandos interativos: temp, order, explore, maxlen, status, /porque, /ast, sair
-
-# Gera um episódio único
-cargo run --release --bin amadeus_m_train -- --say="o gato"
-
-# Benchmark com o modelo treinado (Wikipédia)
+# Avalia o modelo treinado (gera texto, mede qualidade e tempo)
 cargo run --release --bin benchmark_wikipedia
 
-# Agnes (LLM pedagoga)
+# Treino iterativo de morfologia
+cargo run --release --bin train_iterative
+
+# Inspeção: decompõe uma frase em tokens
+cargo run --release --bin test_compiler
+
+# Lista modelos .gguf disponíveis no Ollama
+cargo run --release --bin ollama_ls
+
+# Agnes (LLM pedagoga — requer API key externa)
 cargo run --release --bin agnes_train
-cargo run --release --bin agnes_train --auto --train-morphology
+```
+
+### Testes
+
+```bash
+cargo test --release                                    # todos
+cargo test --release --test gguf_characterization       # formato do artefato
+cargo test --release --test gguf_roundtrip              # save → load
+cargo test --release --test shard_parity                # conteúdo do shard
+cargo test --release --test shard_generation            # geração RAM vs disco
 ```
 
 ### Estado atual (v5.1 — léxico 10K+)
