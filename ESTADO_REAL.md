@@ -256,3 +256,100 @@ teste, a mesma verificação quebra o build. Roda em 0,18s contra ~30s do binár
 
 `grammar_load.rs` foi reescrito: o teste anterior carregava dois modelos de
 795 MB simultâneos e era morto por OOM. Agora carrega um e gera a partir dele.
+
+---
+
+## 8. Hipercubo vs transformer: medição (2026-09-28)
+
+Baseline permanente em `src/bin/baseline_transformer.rs`, para que a comparação
+seja repetível em vez de afirmada. `src/bin/mede_cubo.rs` faz o mesmo pelo
+lado do hipercubo.
+
+###throughput e memória
+
+Mesmo hardware (4 cores, i5 540, 5,7 GB RAM), geração
+autoregressiva de 500 tokens. Pesos aleatórios nos dois: mede custo de
+inferência, não qualidade.
+
+**Hipercubo** (modelo real, 4,64M contextos, chave `u64`):
+
+| Configuração | RSS | tok/s | ms/token |
+|---|---|---|---|
+| com sharding | 298 MB | 44,3 | 22,6 |
+| sem sharding | 561 MB | 40,9 | 24,4 |
+
+**Transformer decoder** (llama-like, `baseline_transformer`):
+
+| Vocabulário | Layers | Embd | RSS | tok/s | ms/token |
+|---|---|---|---|---|---|
+| 1.379 | 4 | 256 | **7 MB** | **129,3** | 7,7 |
+| 75.741 | 4 | 256 | 152 MB | 31,7 | 31,5 |
+| 75.741 | 8 | 512 | 307 MB | 12,1 | 82,3 |
+| 75.741 | 12 | 768 | 464 MB | 5,2 | 190,7 |
+
+### O que os números dizem
+
+**No vocabulário pequeno (1.379), o transformer ganha de lavada:** 7 MB
+contra 298 MB, e 129 tok/s contra 44. São 43x menos memória e 3x mais rápido.
+
+**No vocabulário do modelo real (75.741), a distância fecha:** 152 MB contra
+298 MB, e 31,7 tok/s contra 44,3. Ainda melhor em RAM, ainda mais lento em
+velocidade.
+
+**O gargalo do transformer é o custo quadrático doembedding**: com
+vocabulário grande, `tok_embeddings` e `output_weight` sozinhos são
+`2 * vocab * embd` f32 — 147 MB só com 75.741 × 256. É por isso que
+vocabulário pequeno é doubly vantajoso para ele.
+
+**O gargalo do hipercubo é a explosão combinatória:** 4,64 milhões de
+contextos para 75.741 palavras. É superlinear no corpus, e é a razão de o
+modelo completo original ter 7,67 milhões de contextos e 2 GB.
+
+### A resposta honesta
+
+A theory original — "hipercubo é mais vantajoso para CPU sem GPU" — **não se
+sustenta nos números para inferência**, pelo menos nesta implementação:
+
+- O transformer é mais rápido e usa menos memória no mesmo vocabulário.
+- A vantagem conceivable do hipercubo seria **memória por parâmetro aprendido**
+  em vocabulário pequeno, mas 7 MB contra 298 MB contradiz isso.
+
+O que o hipercubo tem que o transformer não tem, e que este baseline **não
+mede** porque usa pesos aleatórios: nada. A qualidade — gramática, semântica,
+coerência de texto longo — depende de treino, e o transformer não foi treinado
+neste repositório.
+
+A comparação honesta de qualidade exigiria treinar os dois no mesmo corpus, o
+que não foi feito. O que se pode afirmar hoje é sobre **custo**, e o custo
+favorece o transformer.
+
+### Quando o hipercubo ainda faz sentido
+
+- Corpus muito pequeno (centenas de milhares de tokens), onde a explosão
+  combinatória ainda é pequena e o `train` é de segundos.
+- Quando o número de tokens distintos é pequeno e a repetição alta: a tabela
+  de frequência é uma Representação muito eficiente nesse regime, e o
+  transformer desperdiça capacidade em parâmetros que nunca ativam.
+
+Isso é hipótese, não medição. Para decidir de verdade: treinar os dois no
+mesmo corpus pequeno e comparar a qualidade do texto gerado.
+
+### Colisão da chave canônica: medida, não estimada
+
+`pack8d` usa 50 bits por token, então ordem 3 são 150 bits e não cabem num
+`u64`. A chave canônica colide de propósito com FxHash.
+
+Medido no corpus completo (2.067.373 contextos **distintos**):
+
+```
+chaves canônicas distintas:      2.067.373
+chaves com >1 contexto distinto: 0
+CONTEXTOS PERDIDOS:              0
+```
+
+**Zero colisões.** O que aparece como "39% de colisão" em medição ingênua é
+duplicata no dado: o compilador dá id de lexema por posição na frase, então
+"o gato" nas posições 0-1 de frases diferentes produz o mesmo contexto, e
+48,3% dos contextos gerados são idênticos byte a byte. Somar as contagens é o
+comportamento correto de uma tabela de frequência. O teste
+`tests/chave_canonica.rs` fixa essa verificação.

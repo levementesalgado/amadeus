@@ -410,7 +410,9 @@ fn main() {
     // de RAM ao carregar. Para experimento e teste de interação, 300k de tokens
     // bastam e o modelo cabe folgado. `0` = sem limite.
     let max_tokens: usize = arg_usize("--max-tokens").unwrap_or(300_000);
-    let mut budget = max_tokens;
+    // `0` significa "sem limite". `usize::MAX` deixa o `budget` diminuir sem
+    // nunca chegar a zero.
+    let mut budget = if max_tokens == 0 { usize::MAX } else { max_tokens };
     let mut truncado = false;
 
     // Compilar cada frase
@@ -430,6 +432,8 @@ fn main() {
 
     if truncado {
         println!("  (limitado a {} tokens)", max_tokens);
+    } else if max_tokens == 0 {
+        println!("  (sem limite de tokens)");
     }
     println!("  {} tokens compilados", all_tokens.len());
     println!();
