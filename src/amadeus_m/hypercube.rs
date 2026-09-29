@@ -52,7 +52,7 @@ pub struct HyperCube {
     pub total_lex: f32,
     // pesos de interpolação fixos
     pub lambda: Vec<f32>,
-    unigram_weight: f32,
+    pub unigram_weight: f32,
     /// Store em disco quando a tabela é grande demais para RAM. Ver `shard.rs`.
     /// Quando presente, `sample_*` lê daqui e `table` fica vazia.
     pub shards: Option<crate::amadeus_m::shard::ShardStore>,
@@ -70,7 +70,14 @@ impl HyperCube {
         let lambda: Vec<f32> = (0..order).map(|i| 0.5_f32.powi(i as i32 + 1)).collect();
         let sum_l: f32 = lambda.iter().sum();
         let lambda: Vec<f32> = lambda.into_iter().map(|l| l / sum_l).collect();
-        let unigram_weight = 0.10;
+        // Peso do unigram puro. A ordem-1 do CUBO já é um unigram
+        // (backoff de 1 token), com peso aprendido pelo EM. O unigram
+        // explícito é uma segunda fonte redundante que semeja palavra rara
+        // no meio da frase. 0.10 é defensável como piso; menor é melhor
+        // se o modelo tem ordem-2 com suporte. Ajustável por
+        // AMADEUS_UNIGRAM_WEIGHT para medir sem recompilar.
+        let unigram_weight: f32 = std::env::var("AMADEUS_UNIGRAM_WEIGHT")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(0.10);
         Self {
             order,
             table: FxHashMap::default(),
@@ -294,7 +301,19 @@ impl HyperCube {
                 .collect();
             if let Some((cands, total)) = self.lookup_ctx(&ctx) {
                 if total > 0.0 {
-                    let w = self.lambda.get(n - 1).copied().unwrap_or(0.1);
+                    // Backoff por suporte: uma ordem cujo contexto tem
+                    // pouca contagem não tem estatística para merecer
+                    // o peso do EM. Ela só entra com peso reduzido, e o
+                    // peso que ela nao usa desce para a ordem menor. Sem
+                    // isso, ordem-2 com contagem 1 ganha o peso inteiro
+                    // (0,66) e acerta por acaso, produzindo salada. Com o
+                    // unigram global zerado, a geracao travava em 1 token
+                    // porque nao havia fallback; aqui o fallback e a ordem-1
+                    // (bigrama de ultima palavra), que e local e faz sentido.
+                    const MIN_SUPPORT: f32 = 3.0;
+                    let support = (total / MIN_SUPPORT).min(1.0);
+                    let w = self.lambda.get(n - 1).copied().unwrap_or(0.1) * support;
+                    if w <= 0.0 { continue; }
                     for &(lx, cnt) in &cands.items {
                         *dist.entry(lx).or_insert(0.0) += w * cnt / total;
                     }
