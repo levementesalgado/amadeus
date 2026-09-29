@@ -884,6 +884,11 @@ fn main() {
     }
 
     println!();
+    println!("  lambdas por ordem (EM data-driven):");
+    for (i, l) in grammar.hier.clause.lambda.iter().enumerate() {
+        println!("    ordem {}: {:.4}", i + 1, l);
+    }
+    println!();
     println!("═══════════════════════════════════════════════════════════");
     println!("  TREINAMENTO MISTO COMPLETO");
     println!("═══════════════════════════════════════════════════════════");

@@ -223,8 +223,6 @@ impl HyperCube {
         let order = self.order;
         if order == 0 || tokens.len() < 2 { return; }
 
-        // Piso mínimo para cada ordem: [0.20, 0.10, 0.05, ...]
-        let floor: Vec<f64> = (0..order).map(|i| 0.20_f64 * 0.5_f64.powi(i as i32)).collect();
         let mut gamma_sum = vec![0.0f64; order];
         let smooth = 1e-10;
 
@@ -265,12 +263,19 @@ impl HyperCube {
 
         let sum_g: f64 = gamma_sum.iter().sum();
         if sum_g > 0.0 {
-            // Interpolar EM (data-driven) com piso (prior): λ_final = 0.7 * λ_em + 0.3 * λ_floor
-            let floor_sum: f64 = floor.iter().sum();
+            // λ puramente data-driven. O EM já mede o quanto cada ordem
+            // explica; forçar um prior fixo só reintroduz o viés contra
+            // ordens esparsas. O unigram fica de fora por ser tratado
+            // separado, via `unigram_weight`.
+            let mut total = 0.0f32;
             for n in 0..order {
-                let em_l = gamma_sum[n] / sum_g;
-                let floor_l = floor[n] / floor_sum;
-                self.lambda[n] = (0.7 * em_l + 0.3 * floor_l) as f32;
+                self.lambda[n] = (gamma_sum[n] / sum_g) as f32;
+                total += self.lambda[n];
+            }
+            if total > 0.0 {
+                for n in 0..order {
+                    self.lambda[n] /= total;
+                }
             }
         }
     }
