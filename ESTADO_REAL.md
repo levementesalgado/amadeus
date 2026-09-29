@@ -287,19 +287,48 @@ inferência, não qualidade.
 | 75.741 | 8 | 512 | 307 MB | 12,1 | 82,3 |
 | 75.741 | 12 | 768 | 464 MB | 5,2 | 190,7 |
 
+### Uso de CPU: a primeira comparação era injusta
+
+O transformer usa **rayon** nas operações de tensor (`src/tensor/ops.rs`), que
+satura os 4 cores. O hipercubo é sequencial. Medir só tok/s favorece quem
+paraleliza — e "CPU-only sem GPU" significa justamente poder usar todos os
+núcleos, então o consumo importa tanto quanto a velocidade.
+
+Ambos os binários agora reportam tempo de CPU de processo (user + system):
+
+| | tok/s | CPU | uso | tok/s por core | RAM |
+|---|---|---|---|---|---|
+| Hipercubo | 65,2 | 7,66 s | **100%** | **16,3** | 298 MB |
+| Transformer (4 cores) | 31,6 | 33,08 s | **209%** | 7,9 | 152 MB |
+| Transformer (1 core) | 22,6 | 21,97 s | 99% | 5,7 | 152 MB |
+
+Com um core, o transformer é 22,6 tok/s. Com quatro, 31,6. Ou seja, o rayon
+compra **1,4x** de velocidade e cobra 2,09x de CPU.
+
+Contra o hipercubo, no mesmo vocabulário: o hipercubo é **2x mais rápido por
+core** (16,3 contra 7,9) e usa metade da CPU. O transformer ganha só em RAM,
+e porque tem metade das camadas, não por eficiência.
+
+O que a benchmark original omitiu, então: o hipercubo é sequencial por
+construção, e isso é uma escolha de arquitetura com custo e benefício. O
+custo é não usar os outros 3 cores. O benefício é metade do consumo para
+tok/s por core maior.
+
 ### O que os números dizem
 
-**No vocabulário pequeno (1.379), o transformer ganha de lavada:** 7 MB
-contra 298 MB, e 129 tok/s contra 44. São 43x menos memória e 3x mais rápido.
+**No vocabulário pequeno (1.379), o transformer ganha de RAM:** 7 MB contra
+298 MB, e 129 tok/s contra 65. O tokenizer de 1.379 palavras torna o
+embedding trivial, e aí não há nada que iguale.
 
-**No vocabulário do modelo real (75.741), a distância fecha:** 152 MB contra
-298 MB, e 31,7 tok/s contra 44,3. Ainda melhor em RAM, ainda mais lento em
-velocidade.
+**No vocabulário do modelo real (75.741), a troca é direta:** o transformer
+usa 152 MB contra 298 MB, mas o hipercubo é 2x mais rápido por core e usa
+metade da CPU. Se o objetivo é não prender os 4 núcleos, o hipercubo ganha.
+Se o objetivo é a menor footprint absoluto possível, o transformer ganha.
 
-**O gargalo do transformer é o custo quadrático doembedding**: com
+**O gargalo do transformer é o custo quadrático do embedding:** com
 vocabulário grande, `tok_embeddings` e `output_weight` sozinhos são
 `2 * vocab * embd` f32 — 147 MB só com 75.741 × 256. É por isso que
-vocabulário pequeno é doubly vantajoso para ele.
+vocabulário pequeno é dobramente vantajoso para ele.
 
 **O gargalo do hipercubo é a explosão combinatória:** 4,64 milhões de
 contextos para 75.741 palavras. É superlinear no corpus, e é a razão de o
@@ -307,12 +336,16 @@ modelo completo original ter 7,67 milhões de contextos e 2 GB.
 
 ### A resposta honesta
 
-A theory original — "hipercubo é mais vantajoso para CPU sem GPU" — **não se
-sustenta nos números para inferência**, pelo menos nesta implementação:
+A theory original — "hipercubo é mais vantajoso para CPU sem GPU" — **se
+sustenta em parte, e é mais estreita do que se supunha.** A leitura correta
+dos números:
 
-- O transformer é mais rápido e usa menos memória no mesmo vocabulário.
-- A vantagem conceivable do hipercubo seria **memória por parâmetro aprendido**
-  em vocabulário pequeno, mas 7 MB contra 298 MB contradiz isso.
+- **RAM:** o transformer vence (152 MB contra 298 MB). A theory previa o
+  contrário.
+- **Velocidade por core:** o hipercubo vence 2x (16,3 contra 7,9 tok/s/core).
+- **Consumo total:** o hipercubo usa metade da CPU para ser 2x mais rápido
+  por core.
+- **Paralelismo:** o hipercubo não usa. Essa é uma escolha, com custo.
 
 O que o hipercubo tem que o transformer não tem, e que este baseline **não
 mede** porque usa pesos aleatórios: nada. A qualidade — gramática, semântica,
@@ -320,8 +353,9 @@ coerência de texto longo — depende de treino, e o transformer não foi treina
 neste repositório.
 
 A comparação honesta de qualidade exigiria treinar os dois no mesmo corpus, o
-que não foi feito. O que se pode afirmar hoje é sobre **custo**, e o custo
-favorece o transformer.
+que não foi feito. O que se pode afirmar hoje é sobre **custo**, e o custo é
+dividido: o transformer ganha em RAM, o hipercubo ganha em velocidade por core
+e em consumo de CPU.
 
 ### Quando o hipercubo ainda faz sentido
 

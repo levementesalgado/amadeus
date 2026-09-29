@@ -21,6 +21,23 @@ fn rss_mb() -> u64 {
         / 1024
 }
 
+
+/// Tempo de CPU do processo (user + system), em segundos.
+/// Usado para distinguir velocidade de paralelismo: o transformer usa rayon e
+/// satura os cores, então tok/s sozinho não diz quanto custa por core.
+fn cpu_s() -> f64 {
+    let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+    let c: Vec<&str> = stat.split_whitespace().collect();
+    let utime: f64 = c.get(13).and_then(|v| v.parse().ok()).unwrap_or(0.0);
+    let stime: f64 = c.get(14).and_then(|v| v.parse().ok()).unwrap_or(0.0);
+    (utime + stime) / 100.0
+}
+
+/// Núcleos disponíveis, para normalizar.
+fn n_cores() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+}
+
 fn main() {
     let path = std::env::args().nth(1).unwrap();
     let alvo: usize = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(500);
@@ -82,6 +99,7 @@ fn main() {
     // Throughput limpo: uma sequência longa, sem parse.
     let mut rng = fastrand::Rng::with_seed(7);
     let mut hist: Vec<Token7> = vec![Token7::new(100, 0)];
+    let cpu_ini = cpu_s();
     let t = Instant::now();
     let mut n = 0usize;
     for _ in 0..alvo {
@@ -93,8 +111,13 @@ fn main() {
         n += 1;
     }
     let t_gen = t.elapsed().as_secs_f64();
+    let cpu_gen = cpu_s() - cpu_ini;
     eprintln!("\nthroughput: {} tokens em {:.2}s = {:.1} tok/s ({:.2} ms/token)",
         n, t_gen, n as f64 / t_gen.max(0.0001), t_gen * 1000.0 / n.max(1) as f64);
+    eprintln!("cpu: {cpu_gen:.2}s de processo | cores: {}", n_cores());
+    eprintln!("uso de cpu: {:.0}% | tok/s por core: {:.1}",
+        100.0 * cpu_gen / t_gen.max(0.0001),
+        n as f64 / t_gen.max(0.0001) / n_cores() as f64);
     eprintln!("rss final: {} MB", rss_mb());
 }
 

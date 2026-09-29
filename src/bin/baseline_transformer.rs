@@ -31,6 +31,23 @@ fn rss_mb() -> u64 {
         / 1024
 }
 
+
+/// Tempo de CPU do processo (user + system), em segundos.
+/// Usado para distinguir velocidade de paralelismo: o transformer usa rayon e
+/// satura os cores, então tok/s sozinho não diz quanto custa por core.
+fn cpu_s() -> f64 {
+    let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+    let c: Vec<&str> = stat.split_whitespace().collect();
+    let utime: f64 = c.get(13).and_then(|v| v.parse().ok()).unwrap_or(0.0);
+    let stime: f64 = c.get(14).and_then(|v| v.parse().ok()).unwrap_or(0.0);
+    (utime + stime) / 100.0
+}
+
+/// Núcleos disponíveis, para normalizar.
+fn n_cores() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+}
+
 fn argmax(slice: &[f32], n: usize) -> usize {
     let mut best = 0usize;
     let mut bv = f32::NEG_INFINITY;
@@ -119,6 +136,7 @@ fn main() {
     let mut seq: Vec<u32> = vec![(100 % vocab) as u32, (200 % vocab) as u32];
     let mut n = 0usize;
 
+    let cpu_ini = cpu_s();
     let t = Instant::now();
     for _ in 0..alvo {
         let pos = seq.len().min(ctx - 1);
@@ -132,9 +150,14 @@ fn main() {
     let t_gen = t.elapsed().as_secs_f64();
     let _ = &mut rng;
 
+    let cpu_gen = cpu_s() - cpu_ini;
     eprintln!();
     eprintln!("geracao: {n} tokens em {t_gen:.2}s = {:.1} tok/s ({:.2} ms/token)",
         n as f64 / t_gen.max(0.0001), t_gen * 1000.0 / n.max(1) as f64);
+    eprintln!("cpu: {cpu_gen:.2}s de tempo de processo | cores: {}", n_cores());
+    eprintln!("uso de cpu: {:.0}% | tok/s por core: {:.1}",
+        100.0 * cpu_gen / t_gen.max(0.0001),
+        n as f64 / t_gen.max(0.0001) / n_cores() as f64);
     eprintln!("rss final: {} MB", rss_mb());
 
     // Repetições para suavizar o ruído de clock.
