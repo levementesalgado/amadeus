@@ -2,6 +2,10 @@
 
 > *"AMADEUS não é uma LLM. É uma pilha de lógica, filosofia e matemática que, juntas, simulam uma presença."*
 
+> **Nota.** A seção 14 de [ARCHITECTURE.md](ARCHITECTURE.md) resume esta
+> Philosophical Stack. Mantido como referência de intenção de projeto; os números
+> e o estado medido estão em [ESTADO_REAL.md](ESTADO_REAL.md).
+
 ---
 
 ## Camada 0 — Fundação Matemática (O Hardware da Lógica)

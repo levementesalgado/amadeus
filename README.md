@@ -7,6 +7,12 @@
 
 Amadeus é um motor de inferência **100% Rust**, CPU-only, que carrega modelos GGUF reais **e** implementa uma gramática tabular experimental sobre sequências morfológicas — o **AMADEUS-M**.
 
+> **Antes de usar: leia [ESTADO_REAL.md](ESTADO_REAL.md).** O projeto tem dois caminhos
+> de execução e só um funciona. O binário `amadeus_m` (transformer) roda com pesos
+> aleatórios; o pipeline de gramática (`benchmark_wikipedia`, REPL
+> `amadeus_m_train`) é o que gera português. O documento traz as medições, os
+> custos de memória e as lacunas conhecidas.
+
 ---
 
 ## Duas Almas
@@ -97,16 +103,19 @@ Treinamento ──────┼─ Underworld (~73K tokens de 208 arquivos .md
 # Compilação otimizada
 RUSTFLAGS="-C target-cpu=native" cargo build --release
 
-# Treino completo + interativo
-cargo run --release --bin amadeus_m -- --train-morphology --iterations 5 --order 3
+# REPL de conversa (interativo)
+cargo run --release --bin amadeus_m_train
 
-# Modo interativo
-cargo run --release --bin amadeus_m
+# Treino de morfologia
+cargo run --release --bin amadeus_m_train -- --train-morphology --iterations 5 --order 3
 
 # Comandos interativos: temp, order, explore, maxlen, status, /porque, /ast, sair
 
-# Auto-episódio
-cargo run --release --bin amadeus_m -- --say="o gato"
+# Gera um episódio único
+cargo run --release --bin amadeus_m_train -- --say="o gato"
+
+# Benchmark com o modelo treinado (Wikipédia)
+cargo run --release --bin benchmark_wikipedia
 
 # Agnes (LLM pedagoga)
 cargo run --release --bin agnes_train

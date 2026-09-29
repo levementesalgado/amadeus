@@ -601,6 +601,37 @@ Documento completo em `ARCHITECTURE_HYBRID.md`. Resumo:
 
 ---
 
+## 12b. CUBO com Sharding (setembro 2026)
+
+A tabela de contextos do CUBO cresce sem limite no treino: 7,67 milhões de
+entradas no corpus da Wikipédia, ~2,9 GB de RAM ao carregar. Como inferência só
+*lê* a tabela, `shard.rs` mantém o spill em disco.
+
+Um arquivo `.cuboshard` por flush. Índice contexto→offset fica em RAM (barato
+e é o que permite saber qual shard consultar); os registros são lidos via mmap,
+e o kernel pode descartar páginas não usadas.
+
+```
+memória real  3,6 GB → 1,0 GB
+geração       4,0s  → 3,9s
+saída         idêntica
+```
+
+API em `HyperCube`: `enable_spill`, `migrate_to_spill`, `load_shards`,
+`flush_pending`, `lookup_ctx`. `train` acumula em `pending` e descarrega por
+threshold. `load_gguf` migra automaticamente acima de 1M de contextos.
+
+Como inferência é leitura pura, os shards são imutáveis; `reinforce` (que é
+treino) aplica o delta em `pending` para o próximo flush, sem reescrever shard
+antigo.
+
+**Ressalva:** o spill roda depois do pico de RAM, então não resolve OOM com
+dois processos carregando o modelo. Ver [ESTADO_REAL.md](ESTADO_REAL.md).
+
+**Módulos**: `shard.rs`
+
+---
+
 ## 13. Estado Atual (v6.3)
 
 ### Métricas
@@ -638,11 +669,14 @@ af279e3 — language filter + early stopping + expanded corpus
 
 ### Documentação
 
-- `ARCHITECTURE.md` — Este arquivo (v6.3)
+- `ARCHITECTURE.md` — Este arquivo (v6.3, **vigente**)
+- `ESTADO_REAL.md` — **Diagnóstico medido**: dois caminhos de execução, custos de memória, lacunas
 - `AMADEUS.md` — Visão geral
 - `ARCHITECTURE_SNN.md` — Rede Neural Spiking
 - `COESAO_SEMANTICA.md` — Coesão semântica + vocabulário morfológico
 - `benchmarks/PROGRESS.md` — Progresso do treinamento
+- `ARCHITECTURE_HYBRID.md` — Parcialmente superado (jul/2026)
+- `PHILOSOPHICAL_STACK.md` — Intenção de projeto (mai/2026)
 
 ---
 

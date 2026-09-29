@@ -2,6 +2,12 @@
 
 > Mapear pesos de modelos comerciais (Llama, Qwen, Phi) para a lógica do Hipercubo 7D/8D e da SNN.
 
+> **⚠️ Documento parcialmente superado.** Escrito em julho/2026, antes da
+> consolidação v6.3. A seção de pipeline híbrido descreve uma integração com
+> modelos comerciais que não está integrada ao fluxo principal. Para o estado
+> medido do projeto, ver [ESTADO_REAL.md](ESTADO_REAL.md) e
+> [ARCHITECTURE.md](ARCHITECTURE.md) (v6.3, vigente).
+
 ---
 
 ## Sumário
