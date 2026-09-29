@@ -50,6 +50,16 @@ pub struct HyperCube {
     // pesos de interpolação fixos
     pub lambda: Vec<f32>,
     unigram_weight: f32,
+    /// Store em disco quando a tabela é grande demais para RAM. Ver `shard.rs`.
+    /// Quando presente, `sample_*` lê daqui e `table` fica vazia.
+    pub shards: Option<crate::amadeus_m::shard::ShardStore>,
+    /// Se true, `train()` faz flush periódico em vez de crescer em RAM.
+    pub spill_enabled: bool,
+    /// Contextos acumulados desde o último flush (modo spill).
+    pub pending: HashMap<Vec<u128>, HashMap<u32, f32>>,
+    pending_totals: HashMap<Vec<u128>, f32>,
+    /// A cada quantos contextos acumulados acontece o flush.
+    pub spill_threshold: usize,
 }
 
 impl HyperCube {
@@ -66,7 +76,99 @@ impl HyperCube {
             total_lex: 0.0,
             lambda,
             unigram_weight,
+            shards: None,
+            spill_enabled: false,
+            pending: HashMap::new(),
+            pending_totals: HashMap::new(),
+            spill_threshold: 2_000_000,
         }
+    }
+
+    /// Habilita spill para disco. A partir daqui `train()` acumula em
+    /// `pending` e descarrega em shards, em vez de crescer `table` em RAM.
+    pub fn enable_spill(&mut self, dir: impl AsRef<std::path::Path>) -> std::io::Result<()> {
+        self.shards = Some(crate::amadeus_m::shard::ShardStore::open(dir)?);
+        self.spill_enabled = true;
+        Ok(())
+    }
+
+    /// Carrega um modelo shardado existente. Deixa `table` vazia: a leitura
+    /// passa a vir do mmap.
+    pub fn load_shards(&mut self, dir: impl AsRef<std::path::Path>) -> std::io::Result<usize> {
+        let store = crate::amadeus_m::shard::ShardStore::open_dir(dir)?;
+        let n = store.total_contexts();
+        self.shards = Some(store);
+        self.table.clear();
+        self.totals.clear();
+        Ok(n)
+    }
+
+    /// Migra a tabela em RAM para `pending` e habilita spill. Usado para
+    /// converter um modelo já carregado (ex.: via `load_gguf`) em um
+    /// shardado, sem precisar retreinar.
+    ///
+    /// Chame `flush_pending()` depois para materializar o primeiro shard.
+    pub fn migrate_to_spill(&mut self, dir: impl AsRef<std::path::Path>) -> std::io::Result<()> {
+        self.pending = std::mem::take(&mut self.table);
+        self.pending_totals = std::mem::take(&mut self.totals);
+        self.enable_spill(dir)
+    }
+
+    /// Descarrega os contextos pendentes para um shard. Sem efeito se vazio.
+    pub fn flush_pending(&mut self) -> std::io::Result<Option<std::path::PathBuf>> {
+        if self.pending.is_empty() {
+            return Ok(None);
+        }
+        let Some(store) = self.shards.as_mut() else {
+            return Ok(None);
+        };
+        let path = store.flush(&self.pending, &self.pending_totals, self.total_lex)?;
+        // `clear()` mantém a capacidade alocada — os buckets ficariam
+        // reservados (GB) e a memória não cairia. `take` devolve um mapa vazio
+        // e a alocação é devolvida ao allocator.
+        self.pending = HashMap::new();
+        self.pending_totals = HashMap::new();
+        Ok(Some(path))
+    }
+
+    /// Busca um contexto: `pending` primeiro (dados mais recentes, somados aos
+    /// antigos), depois shards, depois `table`.
+    ///
+    /// A ordem importa: um contexto pode existir num shard antigo e ter sido
+    /// retreinado depois. Se o shard ganhasse, o treino recente seria
+    /// silenciosamente ignorado.
+    /// Retorna (candidatos, soma).
+    pub fn lookup_ctx(&mut self, ctx: &[u128]) -> Option<(HashMap<u32, f32>, f32)> {
+        if let Some(cands) = self.pending.get(ctx) {
+            // Some as contagens do shard antigo, para manter o histórico.
+            let mut merged = cands.clone();
+            if let Some(store) = self.shards.as_mut() {
+                if let Some((old, _)) = store.get(ctx) {
+                    for (&lex, &cnt) in &old {
+                        let e = merged.entry(lex).or_insert(0.0);
+                        *e += cnt;
+                    }
+                }
+            } else if let Some(old) = self.table.get(ctx) {
+                for (&lex, &cnt) in old {
+                    let e = merged.entry(lex).or_insert(0.0);
+                    *e += cnt;
+                }
+            }
+            let sum: f32 = merged.values().sum();
+            return Some((merged, sum));
+        }
+
+        if let Some(store) = self.shards.as_mut() {
+            if let Some(found) = store.get(ctx) {
+                return Some(found);
+            }
+        }
+
+        self.table.get(ctx).map(|c| {
+            let sum = self.totals.get(ctx).copied().unwrap_or_else(|| c.values().sum());
+            (c.clone(), sum)
+        })
     }
 
     pub fn train(&mut self, tokens: &[Token7], clause_depths: &[u8]) {
@@ -96,13 +198,24 @@ impl HyperCube {
             let max_n = self.order.min(i);
             for n in 0..max_n {
                 let ctx = &ctx_cache[i][n];
-                *self.table.entry(ctx.clone()).or_default().entry(lex).or_insert(0.0) += 1.0;
-                *self.totals.entry(ctx.clone()).or_insert(0.0) += 1.0;
+                if self.spill_enabled {
+                    *self.pending.entry(ctx.clone()).or_default().entry(lex).or_insert(0.0) += 1.0;
+                    *self.pending_totals.entry(ctx.clone()).or_insert(0.0) += 1.0;
+                } else {
+                    *self.table.entry(ctx.clone()).or_default().entry(lex).or_insert(0.0) += 1.0;
+                    *self.totals.entry(ctx.clone()).or_insert(0.0) += 1.0;
+                }
             }
         }
 
         // EM: aprender lambdas dos dados
         self.em_train_lambdas(&tokens, &ctx_cache);
+
+        // Descarrega quando o lote pendente passa do limite. Sem isso, `pending`
+        // cresceria sem teto e o ganho de memória se perderia.
+        if self.spill_enabled && self.pending.len() >= self.spill_threshold {
+            let _ = self.flush_pending();
+        }
     }
 
     fn em_train_lambdas(&mut self, tokens: &[Token7], ctx_cache: &[Vec<Vec<u128>>]) {
@@ -123,8 +236,11 @@ impl HyperCube {
 
             let mut probs = vec![0.0f64; order];
             for n in 0..max_n {
-                if let Some(cands) = self.table.get(&ctx_cache[i][n]) {
-                    let total = self.totals.get(&ctx_cache[i][n]).copied().unwrap_or(1.0).max(1.0);
+                // Via lookup_ctx: no modo spill os contadores estão em `pending`
+                // ou em shards, não em `table`. Ler `table` direto daria
+                // probs=0 e deixaria os lambdas no valor inicial.
+                if let Some((cands, total)) = self.lookup_ctx(&ctx_cache[i][n]) {
+                    let total = total.max(1.0);
                     probs[n] = (cands.get(&lex).copied().unwrap_or(0.0) / total) as f64;
                 }
             }
@@ -172,11 +288,10 @@ impl HyperCube {
             let ctx: Vec<u128> = (history.len() - n..history.len())
                 .map(|j| pack8d(&history[j], clause_depths.get(j).copied().unwrap_or(0)))
                 .collect();
-            if let Some(cands) = self.table.get(&ctx) {
-                let total = self.totals.get(&ctx).copied().unwrap_or(1.0);
+            if let Some((cands, total)) = self.lookup_ctx(&ctx) {
                 if total > 0.0 {
                     let w = self.lambda.get(n - 1).copied().unwrap_or(0.1);
-                    for (&lx, &cnt) in cands {
+                    for (&lx, &cnt) in &cands {
                         *dist.entry(lx).or_insert(0.0) += w * cnt / total;
                     }
                 }
@@ -195,7 +310,11 @@ impl HyperCube {
             if alpha > 0.0 && dist.len() >= 2 {
                 let top_k = 20usize.min(dist.len());
                 let mut items: Vec<(u32, f32)> = dist.iter().map(|(&k, &v)| (k, v)).collect();
-                items.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                // Desempate por lexema: sort_by é instável e a ordem de
+                // iteração do HashMap varia com o layout.
+                items.sort_by(|a, b| {
+                    b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0))
+                });
                 let spread: Vec<(u32, f32)> = items.iter().take(top_k).copied().collect();
                 let mut added: HashMap<u32, f32> = HashMap::new();
                 for &(lex, prob) in &spread {
@@ -222,7 +341,9 @@ impl HyperCube {
                         }
                     }
                 }
-                for (other, boost) in added {
+                let mut pares: Vec<(u32, f32)> = added.into_iter().collect();
+                pares.sort_unstable_by_key(|&(k, _)| k);
+                for (other, boost) in pares {
                     *dist.entry(other).or_insert(0.0) += boost;
                 }
             }
@@ -231,13 +352,17 @@ impl HyperCube {
         if dist.is_empty() { return 0; }
 
         if rng.f32() < explore {
-            let keys: Vec<u32> = dist.keys().copied()
-                .filter(|&k| k != 0)
-                .collect();
+            // Ordena por lexema: a ordem de iteração de um HashMap depende do
+            // layout, que muda entre construção por `entry()` e por
+            // `with_capacity`. Sem ordenar, a mesma semente dá tokens diferentes.
+            let mut keys: Vec<u32> = dist.keys().copied().filter(|&k| k != 0).collect();
+            keys.sort_unstable();
             if !keys.is_empty() {
                 return keys[rng.usize(0..keys.len())];
             }
-            return *dist.keys().next().unwrap_or(&0);
+            let mut any: Vec<u32> = dist.keys().copied().collect();
+            any.sort_unstable();
+            return any.first().copied().unwrap_or(0);
         }
 
         let t = temp.max(0.01);
@@ -248,6 +373,12 @@ impl HyperCube {
             if w > 0.0 { sum += w; probs.push((lx, w)); }
         }
         if sum <= 0.0 { return 0; }
+
+        // Ordena por lexema antes da varredura cumulativa. A ordem de iteração
+        // do HashMap é detalhe de implementação, e a amostra depende dela:
+        // sem isso, dois CUBOs com o mesmo conteúdo geram sequências distintas.
+        probs.sort_unstable_by_key(|&(lx, _)| lx);
+
         let mut r = rng.f64() * sum;
         for &(lx, w) in &probs { r -= w; if r <= 0.0 { return lx; } }
         probs.last().map(|x| x.0).unwrap_or(0)
@@ -272,7 +403,13 @@ impl HyperCube {
                 let ctx: Vec<u128> = (i - n..i)
                     .map(|j| pack8d(&tokens[j], clause_depths.get(j).copied().unwrap_or(0)))
                     .collect();
-                if let Some(cands) = self.table.get_mut(&ctx) {
+                // `reinforce` escreve. Shards são imutáveis em inferência, então
+                // no modo spill aplicamos o delta em `pending` e ele vai para o
+                // próximo flush — o shard já gravado não é reescrito.
+                if self.spill_enabled {
+                    *self.pending.entry(ctx.clone()).or_default().entry(t.lex).or_insert(0.0) += delta;
+                    *self.pending_totals.entry(ctx.clone()).or_insert(0.0) += delta;
+                } else if let Some(cands) = self.table.get_mut(&ctx) {
                     if let Some(c) = cands.get_mut(&t.lex) {
                         *c = (*c + delta).max(0.01);
                     }

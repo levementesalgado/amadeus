@@ -41,3 +41,6 @@ worst_*.png
 training/
 *.bin
 *.gguf
+
+# Shards do CUBO — gerados pelo load_gguf e pelo treino com spill
+*_shards/

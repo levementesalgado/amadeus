@@ -41,6 +41,9 @@ pub struct TripleGrammar {
     pub rng: fastrand::Rng,
     // SNN para T3
     pub snn: Option<crate::amadeus_m::snn::SpikingNetwork>,
+    /// Diretório de shards do CUBO clause. `None` = usa `<modelo>_shards`
+    /// ao lado do GGUF. Ver `shard.rs`.
+    pub shard_dir: Option<String>,
     pub snn_enc: Option<crate::amadeus_m::snn::MorphEncoding>,
     // Bigramas: P(next | prev2, prev1)
     pub context_bigrams: HashMap<(u32, u32), HashMap<u32, f32>>,
@@ -82,6 +85,7 @@ impl TripleGrammar {
             exploration_rate: 0.08,
             rng: fastrand::Rng::new(),
             snn: None,
+            shard_dir: None,
             snn_enc: None,
             context_bigrams: HashMap::new(),
             context_totals: HashMap::new(),
@@ -1982,6 +1986,36 @@ impl TripleGrammar {
         }
         if let Some(raw) = read_tensor("cubo.text.blob") {
             Self::read_cubo_blob(raw, &mut self.hier.text);
+        }
+
+        // Migra o CUBO clause para disco se o modelo for grande. O blob é
+        // ~97% do arquivo e vira ~2,9 GB de HashMap em RAM; com spill, fica em
+        // disco e o acesso passa por mmap. O limiar evita o custo de disco
+        // para modelos pequenos.
+        const SPILL_MIN_CTX: usize = 1_000_000;
+        let ctx_count = self.hier.clause.table.len();
+        if ctx_count >= SPILL_MIN_CTX {
+            let dir = self
+                .shard_dir
+                .clone()
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| {
+                    let stem = std::path::Path::new(path)
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "modelo".into());
+                    std::path::PathBuf::from(format!("{stem}_shards"))
+                });
+
+            let _ = std::fs::create_dir_all(&dir);
+            if self.hier.clause.migrate_to_spill(&dir).is_ok() {
+                let _ = self.hier.clause.flush_pending();
+                eprintln!(
+                    "  CUBO clause: {} contextos migrados para disco em {}",
+                    ctx_count,
+                    dir.display()
+                );
+            }
         }
 
         // Load SNN weights (se disponível)
